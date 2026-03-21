@@ -238,13 +238,16 @@ def draw_dashed_rect(draw: ImageDraw.ImageDraw, bbox, color, width=2, dash=10):
 # ---------------------------------------------------------------------------
 
 def _sim_color(sim: float) -> str:
-    """類似度 (SIMILARITY_THRESHOLD〜1.0) を 赤→黄→緑 のカラーコードに変換する。"""
+    """類似度 (SIMILARITY_THRESHOLD〜1.0) を 赤→緑→青 のカラーコードに変換する。
+    低い: 赤  中間: 緑  高い: 青"""
     t = max(0.0, min(1.0, (sim - SIMILARITY_THRESHOLD) / (1.0 - SIMILARITY_THRESHOLD)))
     if t < 0.5:
-        r, g = 255, int(255 * t * 2)
+        # 赤 → 緑
+        r, g, b = int(255 * (1.0 - t * 2)), int(255 * t * 2), 0
     else:
-        r, g = int(255 * (1.0 - t) * 2), 255
-    return f"#{r:02x}{g:02x}00"
+        # 緑 → 青
+        r, g, b = 0, int(255 * (1.0 - (t - 0.5) * 2)), int(255 * (t - 0.5) * 2)
+    return f"#{r:02x}{g:02x}{b:02x}"
 
 
 # ---------------------------------------------------------------------------
