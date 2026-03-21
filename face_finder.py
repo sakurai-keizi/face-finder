@@ -257,41 +257,69 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
     win.title(str(path))
     win.configure(bg="#1e1e1e")
 
+    orig_w, orig_h = pil_image.size
     screen_w = win.winfo_screenwidth()
     screen_h = win.winfo_screenheight()
-    orig_w, orig_h = pil_image.size
-    scale  = min(screen_w * 0.85 / orig_w, screen_h * 0.85 / orig_h, 1.0)
-    disp_w = int(orig_w * scale)
-    disp_h = int(orig_h * scale)
 
-    img  = pil_image.resize((disp_w, disp_h), Image.LANCZOS).copy()
-    draw = ImageDraw.Draw(img)
+    # 初期ウィンドウサイズ: 原寸。ただし画面をはみ出す場合は縮小
+    init_scale = min(screen_w * 0.9 / orig_w, screen_h * 0.9 / orig_h, 1.0)
+    init_w = int(orig_w * init_scale)
+    init_h = int(orig_h * init_scale)
+    win.geometry(f"{init_w}x{init_h}")
 
-    # 点線BBOX: 同画像内の他の顔で有り得そうなもの
-    if face_db is not None and query_emb is not None:
-        q = query_emb / (np.linalg.norm(query_emb) + 1e-8)
-        for rec in face_db.faces_in_image(path):
-            e   = rec["face"].embedding
-            e   = e / (np.linalg.norm(e) + 1e-8)
-            sim = float(np.dot(q, e))
-            rx1, ry1 = rec["face"].bbox[0], rec["face"].bbox[1]
-            mx1, my1 = matched_bbox[0], matched_bbox[1]
-            is_matched = abs(rx1 - mx1) < 5 and abs(ry1 - my1) < 5
-            if not is_matched and sim >= PLAUSIBLE_THRESHOLD:
-                sx1, sy1, sx2, sy2 = [c * scale for c in rec["face"].bbox]
-                draw_dashed_rect(draw, [sx1, sy1, sx2, sy2],
-                                 color="orange", width=max(2, int(2 * scale)), dash=10)
+    canvas = tk.Canvas(win, bg="#1e1e1e", highlightthickness=0)
+    canvas.pack(fill=tk.BOTH, expand=True)
 
-    # 実線BBOX: マッチした顔
-    lw = max(2, int(3 * scale))
-    x1, y1, x2, y2 = [c * scale for c in matched_bbox]
-    draw.rectangle([x1, y1, x2, y2], outline="yellow", width=lw)
+    # BBOXを描画した画像を生成（スケール引数に応じて）
+    def _render(scale: float) -> Image.Image:
+        disp_w = int(orig_w * scale)
+        disp_h = int(orig_h * scale)
+        img  = pil_image.resize((disp_w, disp_h), Image.LANCZOS).copy()
+        draw = ImageDraw.Draw(img)
 
-    photo = ImageTk.PhotoImage(img)
-    label = tk.Label(win, image=photo, bg="#1e1e1e")
-    label.pack()
-    label.image = photo
-    win.geometry(f"{disp_w}x{disp_h}")
+        # 点線BBOX: 有り得そうな他の顔
+        if face_db is not None and query_emb is not None:
+            q = query_emb / (np.linalg.norm(query_emb) + 1e-8)
+            for rec in face_db.faces_in_image(path):
+                e   = rec["face"].embedding
+                e   = e / (np.linalg.norm(e) + 1e-8)
+                sim = float(np.dot(q, e))
+                rx1, ry1 = rec["face"].bbox[0], rec["face"].bbox[1]
+                mx1, my1 = matched_bbox[0], matched_bbox[1]
+                if not (abs(rx1 - mx1) < 5 and abs(ry1 - my1) < 5) and sim >= PLAUSIBLE_THRESHOLD:
+                    sx1, sy1, sx2, sy2 = [c * scale for c in rec["face"].bbox]
+                    draw_dashed_rect(draw, [sx1, sy1, sx2, sy2],
+                                     color="orange", width=max(2, int(2 * scale)), dash=10)
+
+        # 実線BBOX: マッチした顔
+        x1, y1, x2, y2 = [c * scale for c in matched_bbox]
+        draw.rectangle([x1, y1, x2, y2], outline="yellow", width=max(2, int(3 * scale)))
+        return img
+
+    photo_ref   = [None]
+    resize_after = [None]
+
+    def _redraw(event=None):
+        cw = canvas.winfo_width()
+        ch = canvas.winfo_height()
+        if cw <= 1 or ch <= 1:
+            return
+        scale = min(cw / orig_w, ch / orig_h)
+        img   = _render(scale)
+        photo = ImageTk.PhotoImage(img)
+        photo_ref[0] = photo
+        canvas.delete("all")
+        ox = (cw - img.width)  // 2
+        oy = (ch - img.height) // 2
+        canvas.create_image(ox, oy, anchor=tk.NW, image=photo)
+
+    def _on_resize(event):
+        # リサイズ中の連続イベントをまとめて 80ms 後に一度だけ再描画
+        if resize_after[0]:
+            win.after_cancel(resize_after[0])
+        resize_after[0] = win.after(80, _redraw)
+
+    canvas.bind("<Configure>", _on_resize)
 
 
 # ---------------------------------------------------------------------------
