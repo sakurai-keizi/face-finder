@@ -10,7 +10,10 @@
 # ///
 
 import sys
+import hashlib
+import pickle
 import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 import tkinter as tk
 from tkinter import scrolledtext
@@ -19,11 +22,60 @@ from PIL import Image, ImageTk, ImageDraw
 from insightface.app import FaceAnalysis
 
 
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
+IMAGE_EXTENSIONS    = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
 SIMILARITY_THRESHOLD = 0.35   # 同一人物と判定するコサイン類似度の閾値
 PLAUSIBLE_THRESHOLD  = 0.20   # 元画像で点線BBOXを付ける下限閾値
-THUMB_SIZE  = 220
-RESULT_COLS = 4
+THUMB_SIZE           = 220
+RESULT_COLS          = 4
+CACHE_FILENAME       = ".face_finder_cache.pkl"
+CACHE_VERSION        = 1
+
+
+# ---------------------------------------------------------------------------
+# キャッシュ用データクラス（InsightFace face オブジェクトの代替）
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CachedFace:
+    bbox:      np.ndarray
+    embedding: np.ndarray
+    det_score: float             = 0.0
+    gender:    int | None        = None
+    age:       int | None        = None
+    kps:       np.ndarray | None = None
+
+
+# ---------------------------------------------------------------------------
+# キャッシュ I/O
+# ---------------------------------------------------------------------------
+
+def _load_cache(cache_path: Path) -> dict[str, list[CachedFace]]:
+    if not cache_path.exists():
+        return {}
+    try:
+        with open(cache_path, "rb") as f:
+            data = pickle.load(f)
+        if isinstance(data, dict) and data.get("__version__") == CACHE_VERSION:
+            return data.get("faces", {})
+    except Exception as e:
+        print(f"[Cache] Load error ({e}), starting fresh")
+    return {}
+
+
+def _save_cache(cache_path: Path, cache: dict[str, list[CachedFace]]) -> None:
+    try:
+        with open(cache_path, "wb") as f:
+            pickle.dump({"__version__": CACHE_VERSION, "faces": cache}, f)
+    except Exception as e:
+        print(f"[Cache] Save error: {e}")
+
+
+def _hash_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -31,14 +83,21 @@ RESULT_COLS = 4
 # ---------------------------------------------------------------------------
 
 class DirectoryFaceDB:
-    def __init__(self, directory: Path, face_app):
-        self.directory = directory
-        self.face_app  = face_app
-        self.records: list[dict] = []   # {path, face, pil_image}
-        self.status = "idle"
+    def __init__(self, directory: Path, face_app, face_app_lock: threading.Lock):
+        self.directory     = directory
+        self.face_app      = face_app
+        self.face_app_lock = face_app_lock
+        self.cache_path    = directory / CACHE_FILENAME
+        self._cache        = _load_cache(self.cache_path)
+        self._cache_dirty  = False
+        self.records: list[dict] = []   # {path, face (CachedFace), pil_image}
+        self.status  = "idle"
         self.scanned = 0
         self.total   = 0
         self._lock   = threading.Lock()
+
+        n = sum(len(v) for v in self._cache.values())
+        print(f"[Cache] Loaded {len(self._cache)} image(s) / {n} face(s) from cache")
 
     def start_scan(self, on_progress=None, on_complete=None):
         self.status = "scanning"
@@ -48,28 +107,66 @@ class DirectoryFaceDB:
 
     def _scan(self, on_progress, on_complete):
         image_files = sorted(
-            p for p in self.directory.rglob("*") if p.suffix.lower() in IMAGE_EXTENSIONS
+            p for p in self.directory.rglob("*")
+            if p.suffix.lower() in IMAGE_EXTENSIONS
         )
         self.total = len(image_files)
         print(f"[Scan] {self.total} image(s) found in '{self.directory}'")
+
         for i, path in enumerate(image_files):
             if on_progress:
                 on_progress(i + 1, self.total, path.name)
             try:
-                img  = Image.open(path).convert("RGB")
-                bgr  = np.array(img)[:, :, ::-1].copy()
-                faces = self.face_app.get(bgr)
-                n = 0
-                with self._lock:
-                    for face in faces:
-                        if face.embedding is not None:
+                img_hash = _hash_file(path)
+
+                if img_hash in self._cache:
+                    # ---- キャッシュヒット ----
+                    cached = self._cache[img_hash]
+                    img = Image.open(path).convert("RGB")
+                    with self._lock:
+                        for cf in cached:
                             self.records.append(
-                                {"path": path, "face": face, "pil_image": img}
+                                {"path": path, "face": cf, "pil_image": img}
                             )
-                            n += 1
-                print(f"[Scan] ({i + 1}/{self.total}) {path.name}  -> {n} face(s)")
+                    print(f"[Scan] ({i + 1}/{self.total}) {path.name}"
+                          f"  -> {len(cached)} face(s)  [cache]")
+                else:
+                    # ---- 新規: InsightFace で検出 ----
+                    img = Image.open(path).convert("RGB")
+                    bgr = np.array(img)[:, :, ::-1].copy()
+                    with self.face_app_lock:
+                        raw_faces = self.face_app.get(bgr)
+
+                    new_faces: list[CachedFace] = []
+                    for f in raw_faces:
+                        if f.embedding is not None:
+                            new_faces.append(CachedFace(
+                                bbox      = f.bbox.copy(),
+                                embedding = f.embedding.copy(),
+                                det_score = float(f.det_score) if f.det_score is not None else 0.0,
+                                gender    = int(f.gender) if f.gender is not None else None,
+                                age       = int(f.age)    if f.age    is not None else None,
+                                kps       = f.kps.copy()  if f.kps    is not None else None,
+                            ))
+
+                    self._cache[img_hash] = new_faces
+                    self._cache_dirty = True
+
+                    with self._lock:
+                        for cf in new_faces:
+                            self.records.append(
+                                {"path": path, "face": cf, "pil_image": img}
+                            )
+                    print(f"[Scan] ({i + 1}/{self.total}) {path.name}"
+                          f"  -> {len(new_faces)} face(s)")
+
             except Exception as e:
                 print(f"[Scan] ({i + 1}/{self.total}) {path.name}  -> ERROR: {e}")
+
+        if self._cache_dirty:
+            _save_cache(self.cache_path, self._cache)
+            print(f"[Cache] Saved to {self.cache_path}")
+
         self.scanned = self.total
         self.status  = "done"
         print(f"[Scan] Done. Total faces indexed: {len(self.records)}")
@@ -94,7 +191,6 @@ class DirectoryFaceDB:
         return sorted(best_per_image.values(), key=lambda x: x["similarity"], reverse=True)
 
     def faces_in_image(self, path: Path) -> list:
-        """指定画像に含まれる全顔レコードを返す。"""
         with self._lock:
             return [r for r in self.records if r["path"] == path]
 
@@ -104,7 +200,6 @@ class DirectoryFaceDB:
 # ---------------------------------------------------------------------------
 
 def draw_dashed_rect(draw: ImageDraw.ImageDraw, bbox, color, width=2, dash=10):
-    """PIL には点線が無いので手動で描画する。"""
     x1, y1, x2, y2 = [int(c) for c in bbox]
 
     def dashed_line(x0, y0, x1e, y1e):
@@ -123,10 +218,10 @@ def draw_dashed_rect(draw: ImageDraw.ImageDraw, bbox, color, width=2, dash=10):
             i += dash
             drawing = not drawing
 
-    dashed_line(x1, y1, x2, y1)  # 上
-    dashed_line(x2, y1, x2, y2)  # 右
-    dashed_line(x2, y2, x1, y2)  # 下
-    dashed_line(x1, y2, x1, y1)  # 左
+    dashed_line(x1, y1, x2, y1)
+    dashed_line(x2, y1, x2, y2)
+    dashed_line(x2, y2, x1, y2)
+    dashed_line(x1, y2, x1, y1)
 
 
 # ---------------------------------------------------------------------------
@@ -156,11 +251,6 @@ def make_face_thumb(pil_image: Image.Image, bbox, thumb_size=THUMB_SIZE) -> Imag
 def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                      face_db: "DirectoryFaceDB | None" = None,
                      query_emb: "np.ndarray | None" = None):
-    """
-    元画像を開く。
-    - matched_bbox の顔: 実線・黄色
-    - 同じ画像内の他の顔で PLAUSIBLE_THRESHOLD 以上のもの: 点線・オレンジ
-    """
     win = tk.Toplevel(root)
     win.title(str(path))
     win.configure(bg="#1e1e1e")
@@ -182,10 +272,9 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
             e   = rec["face"].embedding
             e   = e / (np.linalg.norm(e) + 1e-8)
             sim = float(np.dot(q, e))
-            # matched_bbox と重複する顔はスキップ（実線で描くため）
-            rx1, ry1, rx2, ry2 = rec["face"].bbox
-            mx1, my1, mx2, my2 = matched_bbox
-            is_matched = (abs(rx1 - mx1) < 5 and abs(ry1 - my1) < 5)
+            rx1, ry1 = rec["face"].bbox[0], rec["face"].bbox[1]
+            mx1, my1 = matched_bbox[0], matched_bbox[1]
+            is_matched = abs(rx1 - mx1) < 5 and abs(ry1 - my1) < 5
             if not is_matched and sim >= PLAUSIBLE_THRESHOLD:
                 sx1, sy1, sx2, sy2 = [c * scale for c in rec["face"].bbox]
                 draw_dashed_rect(draw, [sx1, sy1, sx2, sy2],
@@ -292,15 +381,24 @@ def main():
         print(f"Error: '{search_dir}' is not a directory")
         sys.exit(1)
 
-    pil_image = Image.open(image_path).convert("RGB")
-    bgr_image = np.array(pil_image)[:, :, ::-1].copy()
-
     print("Loading InsightFace model...")
+    face_app_lock = threading.Lock()
     face_app = FaceAnalysis(providers=["CPUExecutionProvider"])
     face_app.prepare(ctx_id=0, det_size=(640, 640))
 
+    # スキャンをできるだけ早く開始（GUIより前）
+    face_db: DirectoryFaceDB | None = None
+    if search_dir:
+        face_db = DirectoryFaceDB(search_dir, face_app, face_app_lock)
+        # GUIコールバックは後で登録するため、ここでは None で起動
+        face_db.start_scan(on_progress=None, on_complete=None)
+
+    # メイン画像の顔検出（スキャンと並走するが face_app_lock で排他）
     print("Detecting faces in main image...")
-    faces = face_app.get(bgr_image)
+    pil_image = Image.open(image_path).convert("RGB")
+    bgr_image = np.array(pil_image)[:, :, ::-1].copy()
+    with face_app_lock:
+        faces = face_app.get(bgr_image)
     print(f"Found {len(faces)} face(s)")
 
     # --- GUI ---
@@ -327,7 +425,6 @@ def main():
         x1, y1, x2, y2 = [c * scale for c in face.bbox]
         box_items.append(canvas.create_rectangle(x1, y1, x2, y2, outline="lime", width=2))
 
-    # Right panel
     info_frame = tk.Frame(root, width=320, bg="#1e1e1e")
     info_frame.pack(side=tk.RIGHT, fill=tk.Y)
     info_frame.pack_propagate(False)
@@ -346,22 +443,30 @@ def main():
     tk.Label(info_frame, textvariable=status_var, bg="#1e1e1e", fg="#888888",
              font=("Helvetica", 9)).pack(pady=4)
 
-    # Directory face DB
-    face_db: DirectoryFaceDB | None = None
+    # GUIが準備できたのでスキャンの進捗コールバックを登録
+    if face_db:
+        if face_db.status == "done":
+            n = len(face_db.records)
+            status_var.set(f"Ready  ({n} faces indexed)")
+            header_var.set(f"{len(faces)} face(s) detected\nClick to inspect / search")
+        else:
+            status_var.set(f"Scanning {search_dir.name} ...")
+            header_var.set(f"{len(faces)} face(s) detected\nClick to inspect / search")
 
-    if search_dir:
-        face_db = DirectoryFaceDB(search_dir, face_app)
-        status_var.set(f"Scanning {search_dir.name} ...")
+            # スキャン中なら定期的にステータスを更新
+            def _poll_scan():
+                if face_db.status == "done":
+                    n = len(face_db.records)
+                    status_var.set(f"Ready  ({n} faces indexed)")
+                elif face_db.total > 0:
+                    status_var.set(
+                        f"Scanning {face_db.scanned}/{face_db.total} ..."
+                    )
+                    root.after(300, _poll_scan)
+                else:
+                    root.after(300, _poll_scan)
 
-        def on_progress(done, total, name):
-            root.after(0, status_var.set, f"Scanning {done}/{total}: {name}")
-
-        def on_complete(n_faces):
-            root.after(0, status_var.set, f"Ready  ({n_faces} faces indexed)")
-            root.after(0, header_var.set,
-                       f"{len(faces)} face(s) detected\nClick to inspect / search")
-
-        face_db.start_scan(on_progress=on_progress, on_complete=on_complete)
+            root.after(300, _poll_scan)
 
     # Helpers
     def set_info(text):
