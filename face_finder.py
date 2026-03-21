@@ -10,16 +10,18 @@
 # ///
 
 import sys
+import time
 import hashlib
 import pickle
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 import tkinter as tk
-from tkinter import scrolledtext
+from tkinter import scrolledtext, ttk
 import numpy as np
 from PIL import Image, ImageTk, ImageDraw
 from insightface.app import FaceAnalysis
+import onnxruntime
 
 
 IMAGE_EXTENSIONS    = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
@@ -381,28 +383,102 @@ def main():
         print(f"Error: '{search_dir}' is not a directory")
         sys.exit(1)
 
-    print("Loading InsightFace model...")
-    face_app_lock = threading.Lock()
     trt_cache_dir = Path.home() / ".cache" / "face_finder" / "trt"
     trt_cache_dir.mkdir(parents=True, exist_ok=True)
-    face_app = FaceAnalysis(providers=[
-        ("TensorrtExecutionProvider", {
-            "trt_engine_cache_enable": True,
-            "trt_engine_cache_path":   str(trt_cache_dir),
-        }),
-        "CUDAExecutionProvider",
-        "CPUExecutionProvider",
-    ])
-    face_app.prepare(ctx_id=0, det_size=(640, 640))
 
-    # スキャンをできるだけ早く開始（GUIより前）
+    trt_available  = "TensorrtExecutionProvider" in onnxruntime.get_available_providers()
+    trt_needs_build = trt_available and not any(trt_cache_dir.glob("*.engine"))
+
+    # --- ローディング画面（GUI を先に起動）---
+    root = tk.Tk()
+    root.title("Face Finder - 初期化中")
+    root.configure(bg="#1e1e1e")
+    root.resizable(False, False)
+
+    load_frame = tk.Frame(root, bg="#1e1e1e", padx=48, pady=36)
+    load_frame.pack()
+
+    if trt_needs_build:
+        title_text  = "TensorRT エンジンを初回ビルド中"
+        detail_text = "初回起動時のみ数分かかります。\n次回以降はキャッシュが使われ数秒で起動します。"
+        print("[Init] TensorRT engine build required (first run). This may take several minutes.")
+    elif trt_available:
+        title_text  = "TensorRT エンジンを読み込み中"
+        detail_text = "しばらくお待ちください。"
+        print("[Init] Loading TensorRT engine from cache.")
+    else:
+        title_text  = "InsightFace モデルを読み込み中"
+        detail_text = "しばらくお待ちください。"
+        print("[Init] Loading InsightFace model.")
+
+    tk.Label(load_frame, text=title_text, bg="#1e1e1e", fg="white",
+             font=("Helvetica", 14, "bold")).pack(pady=(0, 8))
+    tk.Label(load_frame, text=detail_text, bg="#1e1e1e", fg="#aaaaaa",
+             font=("Helvetica", 10), justify=tk.CENTER).pack(pady=(0, 20))
+
+    style = ttk.Style(root)
+    style.theme_use("default")
+    style.configure("dark.Horizontal.TProgressbar",
+                    troughcolor="#2d2d2d", background="#4a9eff", borderwidth=0)
+    progress = ttk.Progressbar(load_frame, mode="indeterminate", length=320,
+                               style="dark.Horizontal.TProgressbar")
+    progress.pack(pady=(0, 14))
+    progress.start(40)
+
+    elapsed_var = tk.StringVar(value="経過: 0 秒")
+    tk.Label(load_frame, textvariable=elapsed_var, bg="#1e1e1e", fg="#666666",
+             font=("Helvetica", 9)).pack()
+
+    root.geometry("420x220")
+    root.update()
+
+    start_time = time.time()
+
+    def _tick():
+        elapsed = int(time.time() - start_time)
+        elapsed_var.set(f"経過: {elapsed} 秒")
+        root.after(1000, _tick)
+
+    root.after(1000, _tick)
+
+    # --- バックグラウンドで InsightFace 初期化 ---
+    init_result: dict = {}
+
+    def _do_init():
+        face_app = FaceAnalysis(providers=[
+            ("TensorrtExecutionProvider", {
+                "trt_engine_cache_enable": True,
+                "trt_engine_cache_path":   str(trt_cache_dir),
+            }),
+            "CUDAExecutionProvider",
+            "CPUExecutionProvider",
+        ])
+        face_app.prepare(ctx_id=0, det_size=(640, 640))
+        init_result["face_app"] = face_app
+        root.after(0, _on_init_done)
+
+    threading.Thread(target=_do_init, daemon=True).start()
+
+    def _on_init_done():
+        elapsed = time.time() - start_time
+        print(f"[Init] Done in {elapsed:.1f}s")
+        progress.stop()
+        load_frame.destroy()
+        _setup_main(root, image_path, search_dir, init_result["face_app"])
+
+    root.mainloop()
+
+
+def _setup_main(root: tk.Tk, image_path: str, search_dir: Path | None, face_app):
+    face_app_lock = threading.Lock()
+
+    # スキャンを即時開始
     face_db: DirectoryFaceDB | None = None
     if search_dir:
         face_db = DirectoryFaceDB(search_dir, face_app, face_app_lock)
-        # GUIコールバックは後で登録するため、ここでは None で起動
-        face_db.start_scan(on_progress=None, on_complete=None)
+        face_db.start_scan()
 
-    # メイン画像の顔検出（スキャンと並走するが face_app_lock で排他）
+    # メイン画像の顔検出
     print("Detecting faces in main image...")
     pil_image = Image.open(image_path).convert("RGB")
     bgr_image = np.array(pil_image)[:, :, ::-1].copy()
@@ -410,9 +486,8 @@ def main():
         faces = face_app.get(bgr_image)
     print(f"Found {len(faces)} face(s)")
 
-    # --- GUI ---
-    root = tk.Tk()
     root.title(f"Face Finder - {image_path}")
+    root.resizable(True, True)
 
     screen_w = root.winfo_screenwidth()
     screen_h = root.winfo_screenheight()
@@ -452,32 +527,23 @@ def main():
     tk.Label(info_frame, textvariable=status_var, bg="#1e1e1e", fg="#888888",
              font=("Helvetica", 9)).pack(pady=4)
 
-    # GUIが準備できたのでスキャンの進捗コールバックを登録
     if face_db:
+        header_var.set(f"{len(faces)} face(s) detected\nClick to inspect / search")
         if face_db.status == "done":
-            n = len(face_db.records)
-            status_var.set(f"Ready  ({n} faces indexed)")
-            header_var.set(f"{len(faces)} face(s) detected\nClick to inspect / search")
+            status_var.set(f"Ready  ({len(face_db.records)} faces indexed)")
         else:
             status_var.set(f"Scanning {search_dir.name} ...")
-            header_var.set(f"{len(faces)} face(s) detected\nClick to inspect / search")
 
-            # スキャン中なら定期的にステータスを更新
             def _poll_scan():
                 if face_db.status == "done":
-                    n = len(face_db.records)
-                    status_var.set(f"Ready  ({n} faces indexed)")
-                elif face_db.total > 0:
-                    status_var.set(
-                        f"Scanning {face_db.scanned}/{face_db.total} ..."
-                    )
-                    root.after(300, _poll_scan)
+                    status_var.set(f"Ready  ({len(face_db.records)} faces indexed)")
                 else:
+                    if face_db.total > 0:
+                        status_var.set(f"Scanning {face_db.scanned}/{face_db.total} ...")
                     root.after(300, _poll_scan)
 
             root.after(300, _poll_scan)
 
-    # Helpers
     def set_info(text):
         info_text.config(state=tk.NORMAL)
         info_text.delete("1.0", tk.END)
@@ -544,7 +610,6 @@ def main():
         open_results_window(root, results, face_idx, face_db=face_db, query_emb=query_emb)
 
     canvas.bind("<Button-1>", on_click)
-    root.mainloop()
 
 
 if __name__ == "__main__":
