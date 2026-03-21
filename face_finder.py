@@ -20,31 +20,31 @@ from insightface.app import FaceAnalysis
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
-SIMILARITY_THRESHOLD = 0.35   # cosine similarity (buffalo_l 512-dim embedding)
-THUMB_SIZE = 220               # result thumbnail size (px)
-RESULT_COLS = 4                # columns in result grid
+SIMILARITY_THRESHOLD = 0.35   # 同一人物と判定するコサイン類似度の閾値
+PLAUSIBLE_THRESHOLD  = 0.20   # 元画像で点線BBOXを付ける下限閾値
+THUMB_SIZE  = 220
+RESULT_COLS = 4
 
 
 # ---------------------------------------------------------------------------
-# Directory face database (scanned in background thread)
+# Directory face database
 # ---------------------------------------------------------------------------
 
 class DirectoryFaceDB:
     def __init__(self, directory: Path, face_app):
         self.directory = directory
-        self.face_app = face_app
+        self.face_app  = face_app
         self.records: list[dict] = []   # {path, face, pil_image}
-        self.status = "idle"            # idle / scanning / done / error
+        self.status = "idle"
         self.scanned = 0
-        self.total = 0
-        self._lock = threading.Lock()
+        self.total   = 0
+        self._lock   = threading.Lock()
 
     def start_scan(self, on_progress=None, on_complete=None):
         self.status = "scanning"
-        t = threading.Thread(
+        threading.Thread(
             target=self._scan, args=(on_progress, on_complete), daemon=True
-        )
-        t.start()
+        ).start()
 
     def _scan(self, on_progress, on_complete):
         image_files = sorted(
@@ -56,8 +56,8 @@ class DirectoryFaceDB:
             if on_progress:
                 on_progress(i + 1, self.total, path.name)
             try:
-                img = Image.open(path).convert("RGB")
-                bgr = np.array(img)[:, :, ::-1].copy()
+                img  = Image.open(path).convert("RGB")
+                bgr  = np.array(img)[:, :, ::-1].copy()
                 faces = self.face_app.get(bgr)
                 n = 0
                 with self._lock:
@@ -71,72 +71,157 @@ class DirectoryFaceDB:
             except Exception as e:
                 print(f"[Scan] ({i + 1}/{self.total}) {path.name}  -> ERROR: {e}")
         self.scanned = self.total
-        self.status = "done"
+        self.status  = "done"
         print(f"[Scan] Done. Total faces indexed: {len(self.records)}")
         if on_complete:
             on_complete(len(self.records))
 
-    def search(self, query_emb: np.ndarray, threshold=SIMILARITY_THRESHOLD):
+    def search(self, query_emb: np.ndarray, threshold=SIMILARITY_THRESHOLD) -> list[dict]:
+        """画像ごとに最も類似度の高い顔を1件だけ返す（降順）。"""
         q = query_emb / (np.linalg.norm(query_emb) + 1e-8)
-        results = []
+        best_per_image: dict[Path, dict] = {}
         with self._lock:
             records = list(self.records)
         for rec in records:
-            e = rec["face"].embedding
-            e = e / (np.linalg.norm(e) + 1e-8)
+            e   = rec["face"].embedding
+            e   = e / (np.linalg.norm(e) + 1e-8)
             sim = float(np.dot(q, e))
-            if sim >= threshold:
-                results.append({**rec, "similarity": sim})
-        results.sort(key=lambda x: x["similarity"], reverse=True)
-        return results
+            if sim < threshold:
+                continue
+            key = rec["path"]
+            if key not in best_per_image or sim > best_per_image[key]["similarity"]:
+                best_per_image[key] = {**rec, "similarity": sim}
+        return sorted(best_per_image.values(), key=lambda x: x["similarity"], reverse=True)
+
+    def faces_in_image(self, path: Path) -> list:
+        """指定画像に含まれる全顔レコードを返す。"""
+        with self._lock:
+            return [r for r in self.records if r["path"] == path]
 
 
 # ---------------------------------------------------------------------------
-# Result window
+# Drawing helpers
+# ---------------------------------------------------------------------------
+
+def draw_dashed_rect(draw: ImageDraw.ImageDraw, bbox, color, width=2, dash=10):
+    """PIL には点線が無いので手動で描画する。"""
+    x1, y1, x2, y2 = [int(c) for c in bbox]
+
+    def dashed_line(x0, y0, x1e, y1e):
+        length = ((x1e - x0) ** 2 + (y1e - y0) ** 2) ** 0.5
+        if length == 0:
+            return
+        dx, dy = (x1e - x0) / length, (y1e - y0) / length
+        i, drawing = 0.0, True
+        while i < length:
+            end = min(i + dash, length)
+            if drawing:
+                draw.line(
+                    [(x0 + dx * i, y0 + dy * i), (x0 + dx * end, y0 + dy * end)],
+                    fill=color, width=width,
+                )
+            i += dash
+            drawing = not drawing
+
+    dashed_line(x1, y1, x2, y1)  # 上
+    dashed_line(x2, y1, x2, y2)  # 右
+    dashed_line(x2, y2, x1, y2)  # 下
+    dashed_line(x1, y2, x1, y1)  # 左
+
+
+# ---------------------------------------------------------------------------
+# Result thumbnail
 # ---------------------------------------------------------------------------
 
 def make_face_thumb(pil_image: Image.Image, bbox, thumb_size=THUMB_SIZE) -> Image.Image:
-    """Crop the image around bbox with padding, draw bbox, resize to thumb_size."""
     x1, y1, x2, y2 = [int(c) for c in bbox]
     bw, bh = x2 - x1, y2 - y1
-    pad = max(int(max(bw, bh) * 0.4), 20)
-    W, H = pil_image.size
-    cx1 = max(0, x1 - pad)
-    cy1 = max(0, y1 - pad)
-    cx2 = min(W, x2 + pad)
-    cy2 = min(H, y2 + pad)
+    pad    = max(int(max(bw, bh) * 0.4), 20)
+    W, H   = pil_image.size
+    cx1, cy1 = max(0, x1 - pad), max(0, y1 - pad)
+    cx2, cy2 = min(W, x2 + pad), min(H, y2 + pad)
     crop = pil_image.crop((cx1, cy1, cx2, cy2)).copy()
-    # Draw bbox relative to crop
     draw = ImageDraw.Draw(crop)
-    rx1, ry1 = x1 - cx1, y1 - cy1
-    rx2, ry2 = x2 - cx1, y2 - cy1
-    draw.rectangle([rx1, ry1, rx2, ry2], outline="yellow", width=3)
-    # Fit into thumb_size × thumb_size
+    draw.rectangle([x1 - cx1, y1 - cy1, x2 - cx1, y2 - cy1], outline="yellow", width=3)
     crop.thumbnail((thumb_size, thumb_size), Image.LANCZOS)
     result = Image.new("RGB", (thumb_size, thumb_size), (30, 30, 30))
-    ox = (thumb_size - crop.width) // 2
-    oy = (thumb_size - crop.height) // 2
-    result.paste(crop, (ox, oy))
+    result.paste(crop, ((thumb_size - crop.width) // 2, (thumb_size - crop.height) // 2))
     return result
 
 
-def open_results_window(root, results: list[dict], query_face_idx: int):
+# ---------------------------------------------------------------------------
+# Full image window
+# ---------------------------------------------------------------------------
+
+def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
+                     face_db: "DirectoryFaceDB | None" = None,
+                     query_emb: "np.ndarray | None" = None):
+    """
+    元画像を開く。
+    - matched_bbox の顔: 実線・黄色
+    - 同じ画像内の他の顔で PLAUSIBLE_THRESHOLD 以上のもの: 点線・オレンジ
+    """
+    win = tk.Toplevel(root)
+    win.title(str(path))
+    win.configure(bg="#1e1e1e")
+
+    screen_w = win.winfo_screenwidth()
+    screen_h = win.winfo_screenheight()
+    orig_w, orig_h = pil_image.size
+    scale  = min(screen_w * 0.85 / orig_w, screen_h * 0.85 / orig_h, 1.0)
+    disp_w = int(orig_w * scale)
+    disp_h = int(orig_h * scale)
+
+    img  = pil_image.resize((disp_w, disp_h), Image.LANCZOS).copy()
+    draw = ImageDraw.Draw(img)
+
+    # 点線BBOX: 同画像内の他の顔で有り得そうなもの
+    if face_db is not None and query_emb is not None:
+        q = query_emb / (np.linalg.norm(query_emb) + 1e-8)
+        for rec in face_db.faces_in_image(path):
+            e   = rec["face"].embedding
+            e   = e / (np.linalg.norm(e) + 1e-8)
+            sim = float(np.dot(q, e))
+            # matched_bbox と重複する顔はスキップ（実線で描くため）
+            rx1, ry1, rx2, ry2 = rec["face"].bbox
+            mx1, my1, mx2, my2 = matched_bbox
+            is_matched = (abs(rx1 - mx1) < 5 and abs(ry1 - my1) < 5)
+            if not is_matched and sim >= PLAUSIBLE_THRESHOLD:
+                sx1, sy1, sx2, sy2 = [c * scale for c in rec["face"].bbox]
+                draw_dashed_rect(draw, [sx1, sy1, sx2, sy2],
+                                 color="orange", width=max(2, int(2 * scale)), dash=10)
+
+    # 実線BBOX: マッチした顔
+    lw = max(2, int(3 * scale))
+    x1, y1, x2, y2 = [c * scale for c in matched_bbox]
+    draw.rectangle([x1, y1, x2, y2], outline="yellow", width=lw)
+
+    photo = ImageTk.PhotoImage(img)
+    label = tk.Label(win, image=photo, bg="#1e1e1e")
+    label.pack()
+    label.image = photo
+    win.geometry(f"{disp_w}x{disp_h}")
+
+
+# ---------------------------------------------------------------------------
+# Results window
+# ---------------------------------------------------------------------------
+
+def open_results_window(root, results: list[dict], query_face_idx: int,
+                        face_db=None, query_emb=None):
     win = tk.Toplevel(root)
     win.title(f"Search results for Face #{query_face_idx + 1}  ({len(results)} match(es))")
     win.configure(bg="#1e1e1e")
 
-    # Scrollable canvas
-    outer = tk.Frame(win, bg="#1e1e1e")
+    outer   = tk.Frame(win, bg="#1e1e1e")
     outer.pack(fill=tk.BOTH, expand=True)
-
     vscroll = tk.Scrollbar(outer, orient=tk.VERTICAL)
     vscroll.pack(side=tk.RIGHT, fill=tk.Y)
-
     cv = tk.Canvas(outer, bg="#1e1e1e", yscrollcommand=vscroll.set)
     cv.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     vscroll.config(command=cv.yview)
 
-    inner = tk.Frame(cv, bg="#1e1e1e")
+    inner  = tk.Frame(cv, bg="#1e1e1e")
     cv_win = cv.create_window((0, 0), window=inner, anchor=tk.NW)
 
     def on_configure(event):
@@ -145,16 +230,10 @@ def open_results_window(root, results: list[dict], query_face_idx: int):
 
     inner.bind("<Configure>", on_configure)
     cv.bind("<Configure>", on_configure)
+    win.bind("<MouseWheel>", lambda e: cv.yview_scroll(int(-1 * e.delta / 120), "units"))
+    win.bind("<Button-4>",   lambda e: cv.yview_scroll(-1, "units"))
+    win.bind("<Button-5>",   lambda e: cv.yview_scroll(1,  "units"))
 
-    # Bind mouse-wheel scroll
-    def _on_mousewheel(event):
-        cv.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-    win.bind("<MouseWheel>", _on_mousewheel)
-    win.bind("<Button-4>", lambda e: cv.yview_scroll(-1, "units"))
-    win.bind("<Button-5>", lambda e: cv.yview_scroll(1, "units"))
-
-    # Keep PhotoImage references alive
     photo_refs = []
 
     if not results:
@@ -164,11 +243,8 @@ def open_results_window(root, results: list[dict], query_face_idx: int):
         return
 
     for idx, rec in enumerate(results):
-        col = idx % RESULT_COLS
-        row = idx // RESULT_COLS
-
         frame = tk.Frame(inner, bg="#2a2a2a", bd=1, relief=tk.RIDGE)
-        frame.grid(row=row, column=col, padx=6, pady=6, sticky="n")
+        frame.grid(row=idx // RESULT_COLS, column=idx % RESULT_COLS, padx=6, pady=6, sticky="n")
 
         thumb = make_face_thumb(rec["pil_image"], rec["face"].bbox)
         photo = ImageTk.PhotoImage(thumb)
@@ -177,57 +253,27 @@ def open_results_window(root, results: list[dict], query_face_idx: int):
         img_label = tk.Label(frame, image=photo, bg="#2a2a2a", cursor="hand2")
         img_label.pack()
 
-        name = Path(rec["path"]).name
         sim_pct = rec["similarity"] * 100
         tk.Label(
             frame,
-            text=f"{name}\n{sim_pct:.1f}%",
-            bg="#2a2a2a",
-            fg="#cccccc",
-            font=("Helvetica", 8),
-            wraplength=THUMB_SIZE,
-            justify=tk.CENTER,
+            text=f"{Path(rec['path']).name}\n{sim_pct:.1f}%",
+            bg="#2a2a2a", fg="#cccccc", font=("Helvetica", 8),
+            wraplength=THUMB_SIZE, justify=tk.CENTER,
         ).pack(pady=(2, 4))
 
-        # Click thumbnail → open full image in separate window
         def open_full(event, r=rec):
-            _open_full_image(root, r["pil_image"], r["face"].bbox, r["path"])
+            _open_full_image(root, r["pil_image"], r["face"].bbox, r["path"],
+                             face_db=face_db, query_emb=query_emb)
 
         img_label.bind("<Button-1>", open_full)
 
-    win.inner_photos = photo_refs  # prevent GC
+    win.inner_photos = photo_refs
 
-    # Resize window to fit grid (max 1200 wide)
     cols_actual = min(len(results), RESULT_COLS)
     win_w = min(cols_actual * (THUMB_SIZE + 20) + 30, 1200)
     rows_actual = (len(results) + RESULT_COLS - 1) // RESULT_COLS
     win_h = min(rows_actual * (THUMB_SIZE + 60) + 20, 900)
     win.geometry(f"{win_w}x{win_h}")
-
-
-def _open_full_image(root, pil_image: Image.Image, bbox, path):
-    """Open the full source image with bbox drawn, in its own window."""
-    win = tk.Toplevel(root)
-    win.title(str(path))
-    win.configure(bg="#1e1e1e")
-
-    screen_w = win.winfo_screenwidth()
-    screen_h = win.winfo_screenheight()
-    orig_w, orig_h = pil_image.size
-    scale = min(screen_w * 0.85 / orig_w, screen_h * 0.85 / orig_h, 1.0)
-    disp_w = int(orig_w * scale)
-    disp_h = int(orig_h * scale)
-
-    img = pil_image.resize((disp_w, disp_h), Image.LANCZOS).copy()
-    draw = ImageDraw.Draw(img)
-    x1, y1, x2, y2 = [c * scale for c in bbox]
-    draw.rectangle([x1, y1, x2, y2], outline="yellow", width=max(2, int(3 * scale)))
-
-    photo = ImageTk.PhotoImage(img)
-    label = tk.Label(win, image=photo, bg="#1e1e1e")
-    label.pack()
-    label.image = photo
-    win.geometry(f"{disp_w}x{disp_h}")
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +292,6 @@ def main():
         print(f"Error: '{search_dir}' is not a directory")
         sys.exit(1)
 
-    # Load main image
     pil_image = Image.open(image_path).convert("RGB")
     bgr_image = np.array(pil_image)[:, :, ::-1].copy()
 
@@ -258,14 +303,14 @@ def main():
     faces = face_app.get(bgr_image)
     print(f"Found {len(faces)} face(s)")
 
-    # --- GUI setup ---
+    # --- GUI ---
     root = tk.Tk()
     root.title(f"Face Finder - {image_path}")
 
     screen_w = root.winfo_screenwidth()
     screen_h = root.winfo_screenheight()
     orig_w, orig_h = pil_image.size
-    scale = min(screen_w * 0.7 / orig_w, screen_h * 0.9 / orig_h, 1.0)
+    scale  = min(screen_w * 0.7 / orig_w, screen_h * 0.9 / orig_h, 1.0)
     disp_w = int(orig_w * scale)
     disp_h = int(orig_h * scale)
 
@@ -280,8 +325,7 @@ def main():
     box_items = []
     for face in faces:
         x1, y1, x2, y2 = [c * scale for c in face.bbox]
-        item = canvas.create_rectangle(x1, y1, x2, y2, outline="lime", width=2)
-        box_items.append(item)
+        box_items.append(canvas.create_rectangle(x1, y1, x2, y2, outline="lime", width=2))
 
     # Right panel
     info_frame = tk.Frame(root, width=320, bg="#1e1e1e")
@@ -289,10 +333,8 @@ def main():
     info_frame.pack_propagate(False)
 
     header_var = tk.StringVar(value=f"{len(faces)} face(s) detected\nClick a face to inspect")
-    tk.Label(
-        info_frame, textvariable=header_var,
-        bg="#1e1e1e", fg="#cccccc", font=("Helvetica", 11), justify=tk.CENTER,
-    ).pack(pady=(12, 6))
+    tk.Label(info_frame, textvariable=header_var, bg="#1e1e1e", fg="#cccccc",
+             font=("Helvetica", 11), justify=tk.CENTER).pack(pady=(12, 6))
 
     info_text = scrolledtext.ScrolledText(
         info_frame, wrap=tk.WORD, font=("Courier", 9),
@@ -304,7 +346,7 @@ def main():
     tk.Label(info_frame, textvariable=status_var, bg="#1e1e1e", fg="#888888",
              font=("Helvetica", 9)).pack(pady=4)
 
-    # --- Directory face DB (optional) ---
+    # Directory face DB
     face_db: DirectoryFaceDB | None = None
 
     if search_dir:
@@ -321,7 +363,7 @@ def main():
 
         face_db.start_scan(on_progress=on_progress, on_complete=on_complete)
 
-    # --- Helpers ---
+    # Helpers
     def set_info(text):
         info_text.config(state=tk.NORMAL)
         info_text.delete("1.0", tk.END)
@@ -356,7 +398,6 @@ def main():
         face = faces[clicked_idx]
         status_var.set(f"Face #{clicked_idx + 1} selected")
 
-        # Build info text
         lines = [f"=== Face #{clicked_idx + 1} ===\n"]
         bbox = [int(c) for c in face.bbox]
         lines.append(f"Bounding box:\n  x1={bbox[0]}, y1={bbox[1]}\n  x2={bbox[2]}, y2={bbox[3]}\n")
@@ -371,22 +412,22 @@ def main():
             lines.append(f"\nEmbedding dim: {len(emb)}  norm: {np.linalg.norm(emb):.4f}\n")
         set_info("".join(lines))
 
-        # Search directory if available
         if face_db and face.embedding is not None:
             if face_db.status != "done":
                 status_var.set("Still scanning — please wait...")
                 return
             status_var.set("Searching...")
+            query_emb = face.embedding.copy()
 
             def do_search():
-                results = face_db.search(face.embedding)
-                root.after(0, _show_results, results, clicked_idx)
+                results = face_db.search(query_emb)
+                root.after(0, _show_results, results, clicked_idx, query_emb)
 
             threading.Thread(target=do_search, daemon=True).start()
 
-    def _show_results(results, face_idx):
+    def _show_results(results, face_idx, query_emb):
         status_var.set(f"{len(results)} match(es) found")
-        open_results_window(root, results, face_idx)
+        open_results_window(root, results, face_idx, face_db=face_db, query_emb=query_emb)
 
     canvas.bind("<Button-1>", on_click)
     root.mainloop()
