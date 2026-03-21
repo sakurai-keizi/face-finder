@@ -25,6 +25,17 @@ from insightface.app import FaceAnalysis
 import onnxruntime
 from tkinterdnd2 import TkinterDnD, DND_FILES
 
+# tkinterdnd2 の既知バグ: DnD完了後にソースウィンドウへ XdndFinished を
+# 送り返す際、そのウィンドウが既に破棄されていると BadWindow エラーが出る。
+# X11 エラーハンドラを上書きして無視する。
+try:
+    import ctypes
+    _xlib = ctypes.CDLL("libX11.so.6")
+    _X_ERROR_HANDLER = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+    _xlib.XSetErrorHandler(_X_ERROR_HANDLER(lambda d, e: 0))
+except Exception:
+    pass
+
 
 IMAGE_EXTENSIONS    = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
 SIMILARITY_THRESHOLD = 0.35   # 同一人物と判定するコサイン類似度の閾値
