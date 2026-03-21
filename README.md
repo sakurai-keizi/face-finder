@@ -9,6 +9,17 @@
 - [uv](https://github.com/astral-sh/uv)
 - 依存パッケージは `uv run` 実行時に自動インストールされます（手動インストール不要）
 
+GPU を使用する場合は別途システムへのインストールが必要です：
+
+| 機能 | 必要なもの |
+|------|-----------|
+| CUDA（GPU推論） | [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads) |
+| TensorRT（高速GPU推論） | [TensorRT](https://developer.nvidia.com/tensorrt) + CUDA Toolkit |
+
+GPU が無い環境では自動的に CPU にフォールバックします。
+
+> **TensorRT について**: 初回起動時にモデルのエンジンビルドが走るため1〜数分かかります。2回目以降はキャッシュが使われるため高速に起動します。
+
 ## 使い方
 
 ### 基本（画像を開いて顔を確認するだけ）
@@ -47,24 +58,32 @@ uv run face_finder.py group_photo.jpg ./photos/
 
 ### 検索ディレクトリ指定時
 
-起動後、バックグラウンドで指定ディレクトリ内の全画像を自動スキャンします。
+起動直後（GUI表示より前）からバックグラウンドでスキャンを開始します。
 スキャン状況はターミナルとウィンドウ下部のステータスバーに表示されます。
 
 ```
-[Scan] 42 image(s) found in 'photos'
-[Scan] (1/42) img001.jpg  -> 2 face(s)
-[Scan] (2/42) img002.jpg  -> 0 face(s)
+[Cache] Loaded 8 image(s) / 218 face(s) from cache
+[Scan] 8 image(s) found in 'photos'
+[Scan] (1/8) img001.jpg  -> 40 face(s)  [cache]
+[Scan] (2/8) img002.jpg  -> 3 face(s)
 ...
-[Scan] Done. Total faces indexed: 87
+[Scan] Done. Total faces indexed: 218
+[Cache] Saved to photos/.face_finder_cache.pkl
 ```
 
 スキャン完了後に顔をクリックすると類似人物を検索し、**結果ウィンドウ**が開きます。
 
+#### キャッシュ
+
+スキャン済み画像の顔座標・特徴ベクトルは検索ディレクトリ内の `.face_finder_cache.pkl` に保存されます。次回起動時は画像バイナリの SHA-256 ハッシュで同一性を確認し、一致した場合は InsightFace の推論をスキップします。画像が変更された場合はハッシュが変わるため自動的に再検出されます。
+
 ### 結果ウィンドウ
 
-- マッチした顔を類似度の高い順にグリッド表示
+- 画像ごとに最も類似度の高い顔を1件ずつ、類似度の高い順にグリッド表示
 - 各サムネイルに **ファイル名** と **類似度（%）** を表示
-- サムネイルをクリックすると元画像を黄色BBOXつきで別ウィンドウに表示
+- サムネイルをクリックすると元画像を別ウィンドウに表示
+  - マッチした顔：**実線・黄色** BBOX
+  - 同画像内の他の顔で類似度 ≥ 0.20 の顔：**点線・オレンジ** BBOX
 - マウスホイールでスクロール可能
 
 ## 対応画像フォーマット
@@ -76,6 +95,7 @@ uv run face_finder.py group_photo.jpg ./photos/
 | 定数 | デフォルト | 説明 |
 |------|-----------|------|
 | `SIMILARITY_THRESHOLD` | `0.35` | 同一人物と判定するコサイン類似度の閾値（0〜1） |
+| `PLAUSIBLE_THRESHOLD` | `0.20` | 元画像で点線BBOXを付ける下限閾値 |
 | `THUMB_SIZE` | `220` | 結果サムネイルのサイズ（px） |
 | `RESULT_COLS` | `4` | 結果グリッドの列数 |
 
@@ -85,5 +105,7 @@ uv run face_finder.py group_photo.jpg ./photos/
 
 - **顔検出・特徴抽出**: InsightFace `buffalo_l` モデル（512次元 embedding）
 - **類似度計算**: コサイン類似度
+- **推論バックエンド**: TensorRT → CUDA → CPU の順で自動選択
 - **GUI**: tkinter（標準ライブラリ）
-- **ディレクトリスキャン**: バックグラウンドスレッドで実行（GUI操作をブロックしない）
+- **スキャン**: 起動直後からバックグラウンドスレッドで実行（GUI操作をブロックしない）
+- **キャッシュ**: SHA-256ハッシュをキーにした pickle ファイル（`.face_finder_cache.pkl`）
