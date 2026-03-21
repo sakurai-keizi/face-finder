@@ -234,6 +234,20 @@ def draw_dashed_rect(draw: ImageDraw.ImageDraw, bbox, color, width=2, dash=10):
 
 
 # ---------------------------------------------------------------------------
+# Similarity color helper
+# ---------------------------------------------------------------------------
+
+def _sim_color(sim: float) -> str:
+    """類似度 (SIMILARITY_THRESHOLD〜1.0) を 赤→黄→緑 のカラーコードに変換する。"""
+    t = max(0.0, min(1.0, (sim - SIMILARITY_THRESHOLD) / (1.0 - SIMILARITY_THRESHOLD)))
+    if t < 0.5:
+        r, g = 255, int(255 * t * 2)
+    else:
+        r, g = int(255 * (1.0 - t) * 2), 255
+    return f"#{r:02x}{g:02x}00"
+
+
+# ---------------------------------------------------------------------------
 # Result thumbnail
 # ---------------------------------------------------------------------------
 
@@ -375,8 +389,14 @@ def open_results_window(root, results: list[dict], query_face_idx: int,
         return
 
     for idx, rec in enumerate(results):
-        frame = tk.Frame(inner, bg="#2a2a2a", bd=1, relief=tk.RIDGE)
-        frame.grid(row=idx // RESULT_COLS, column=idx % RESULT_COLS, padx=6, pady=6, sticky="n")
+        sim_pct   = rec["similarity"] * 100
+        border_col = _sim_color(rec["similarity"])
+
+        # 外枠（類似度カラー）→ 内枠（ダーク）の2層構造
+        outer = tk.Frame(inner, bg=border_col, padx=3, pady=3)
+        outer.grid(row=idx // RESULT_COLS, column=idx % RESULT_COLS, padx=6, pady=6, sticky="n")
+        frame = tk.Frame(outer, bg="#2a2a2a")
+        frame.pack()
 
         thumb = make_face_thumb(rec["pil_image"], rec["face"].bbox)
         photo = ImageTk.PhotoImage(thumb)
@@ -385,7 +405,6 @@ def open_results_window(root, results: list[dict], query_face_idx: int,
         img_label = tk.Label(frame, image=photo, bg="#2a2a2a", cursor="hand2")
         img_label.pack()
 
-        sim_pct = rec["similarity"] * 100
         tk.Label(
             frame,
             text=f"{Path(rec['path']).name}\n{sim_pct:.1f}%",
