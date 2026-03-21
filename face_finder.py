@@ -383,8 +383,13 @@ def main():
 
     print("Loading InsightFace model...")
     face_app_lock = threading.Lock()
+    trt_cache_dir = Path.home() / ".cache" / "face_finder" / "trt"
+    trt_cache_dir.mkdir(parents=True, exist_ok=True)
     face_app = FaceAnalysis(providers=[
-        "TensorrtExecutionProvider",
+        ("TensorrtExecutionProvider", {
+            "trt_engine_cache_enable": True,
+            "trt_engine_cache_path":   str(trt_cache_dir),
+        }),
         "CUDAExecutionProvider",
         "CPUExecutionProvider",
     ])
