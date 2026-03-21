@@ -6,6 +6,7 @@
 #   "pillow",
 #   "numpy",
 #   "onnxruntime-gpu",
+#   "tkinterdnd2",
 # ]
 # ///
 
@@ -22,6 +23,7 @@ import numpy as np
 from PIL import Image, ImageTk, ImageDraw
 from insightface.app import FaceAnalysis
 import onnxruntime
+from tkinterdnd2 import TkinterDnD, DND_FILES
 
 
 IMAGE_EXTENSIONS    = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
@@ -419,7 +421,7 @@ def main():
     trt_needs_build = trt_available and not any(trt_cache_dir.glob("*.engine"))
 
     # --- ローディング画面（GUI を先に起動）---
-    root = tk.Tk()
+    root = TkinterDnD.Tk()
     root.title("Face Finder - 初期化中")
     root.configure(bg="#1e1e1e")
     root.resizable(False, False)
@@ -500,6 +502,7 @@ def main():
 
 def _setup_main(root: tk.Tk, image_path: str, search_dir: Path | None, face_app):
     face_app_lock = threading.Lock()
+    INFO_PANEL_W  = 320
 
     # スキャンを即時開始
     face_db: DirectoryFaceDB | None = None
@@ -520,11 +523,14 @@ def _setup_main(root: tk.Tk, image_path: str, search_dir: Path | None, face_app)
 
     screen_w = root.winfo_screenwidth()
     screen_h = root.winfo_screenheight()
-    orig_w, orig_h = pil_image.size
-    INFO_PANEL_W = 320
-    scale  = min((screen_w - INFO_PANEL_W) * 0.95 / orig_w, screen_h * 0.95 / orig_h, 1.0)
-    disp_w = int(orig_w * scale)
-    disp_h = int(orig_h * scale)
+
+    def _calc_scale(img: Image.Image) -> float:
+        w, h = img.size
+        return min((screen_w - INFO_PANEL_W) * 0.95 / w, screen_h * 0.95 / h, 1.0)
+
+    scale  = _calc_scale(pil_image)
+    disp_w = int(pil_image.width  * scale)
+    disp_h = int(pil_image.height * scale)
 
     root.geometry(f"{disp_w + INFO_PANEL_W}x{disp_h}")
 
@@ -536,12 +542,12 @@ def _setup_main(root: tk.Tk, image_path: str, search_dir: Path | None, face_app)
     canvas.create_image(0, 0, anchor=tk.NW, image=photo)
     canvas.image = photo
 
-    box_items = []
+    box_items: list = []
     for face in faces:
         x1, y1, x2, y2 = [c * scale for c in face.bbox]
         box_items.append(canvas.create_rectangle(x1, y1, x2, y2, outline="lime", width=2))
 
-    info_frame = tk.Frame(root, width=320, bg="#1e1e1e")
+    info_frame = tk.Frame(root, width=INFO_PANEL_W, bg="#1e1e1e")
     info_frame.pack(side=tk.RIGHT, fill=tk.Y)
     info_frame.pack_propagate(False)
 
@@ -576,6 +582,7 @@ def _setup_main(root: tk.Tk, image_path: str, search_dir: Path | None, face_app)
 
             root.after(300, _poll_scan)
 
+    # ------------------------------------------------------------------ helpers
     def set_info(text):
         info_text.config(state=tk.NORMAL)
         info_text.delete("1.0", tk.END)
@@ -588,6 +595,69 @@ def _setup_main(root: tk.Tk, image_path: str, search_dir: Path | None, face_app)
                               outline="yellow" if i == idx else "lime",
                               width=3 if i == idx else 2)
 
+    def _apply_image(new_path: str, new_pil: Image.Image, new_faces: list):
+        """画像・顔リストを差し替えてキャンバスを更新する。"""
+        nonlocal pil_image, faces, scale
+
+        pil_image = new_pil
+        faces     = new_faces
+        scale     = _calc_scale(new_pil)
+        dw = int(new_pil.width  * scale)
+        dh = int(new_pil.height * scale)
+
+        root.title(f"Face Finder - {new_path}")
+        root.geometry(f"{dw + INFO_PANEL_W}x{dh}")
+        canvas.config(width=dw, height=dh)
+
+        new_photo = ImageTk.PhotoImage(new_pil.resize((dw, dh), Image.LANCZOS))
+        canvas.delete("all")
+        canvas.create_image(0, 0, anchor=tk.NW, image=new_photo)
+        canvas.image = new_photo  # GC防止
+
+        box_items.clear()
+        for face in faces:
+            x1, y1, x2, y2 = [c * scale for c in face.bbox]
+            box_items.append(canvas.create_rectangle(x1, y1, x2, y2, outline="lime", width=2))
+
+        n_label = "Click to inspect / search" if face_db else "Click a face to inspect"
+        header_var.set(f"{len(faces)} face(s) detected\n{n_label}")
+        set_info("")
+
+    # ------------------------------------------------------------------ drag & drop
+    def _on_drop(event):
+        raw = event.data.strip()
+        # tkinterdnd2 はスペースを含むパスを {} で囲む
+        if raw.startswith("{") and raw.endswith("}"):
+            file_path = raw[1:-1]
+        else:
+            file_path = raw.split()[0]
+
+        if Path(file_path).suffix.lower() not in IMAGE_EXTENSIONS:
+            status_var.set("対応していないファイル形式です")
+            return
+
+        status_var.set("読み込み中 ...")
+        print(f"[Drop] {file_path}")
+
+        def _detect():
+            try:
+                new_pil = Image.open(file_path).convert("RGB")
+                new_bgr = np.array(new_pil)[:, :, ::-1].copy()
+                with face_app_lock:
+                    new_faces = face_app.get(new_bgr)
+                print(f"[Drop] Found {len(new_faces)} face(s)")
+                root.after(0, _apply_image, file_path, new_pil, new_faces)
+                root.after(0, status_var.set, "Ready")
+            except Exception as e:
+                print(f"[Drop] Error: {e}")
+                root.after(0, status_var.set, f"エラー: {e}")
+
+        threading.Thread(target=_detect, daemon=True).start()
+
+    canvas.drop_target_register(DND_FILES)
+    canvas.dnd_bind("<<Drop>>", _on_drop)
+
+    # ------------------------------------------------------------------ click
     def on_click(event):
         orig_x = event.x / scale
         orig_y = event.y / scale
