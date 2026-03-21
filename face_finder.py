@@ -521,9 +521,12 @@ def _setup_main(root: tk.Tk, image_path: str, search_dir: Path | None, face_app)
     screen_w = root.winfo_screenwidth()
     screen_h = root.winfo_screenheight()
     orig_w, orig_h = pil_image.size
-    scale  = min(screen_w * 0.7 / orig_w, screen_h * 0.9 / orig_h, 1.0)
+    INFO_PANEL_W = 320
+    scale  = min((screen_w - INFO_PANEL_W) * 0.95 / orig_w, screen_h * 0.95 / orig_h, 1.0)
     disp_w = int(orig_w * scale)
     disp_h = int(orig_h * scale)
+
+    root.geometry(f"{disp_w + INFO_PANEL_W}x{disp_h}")
 
     display_image = pil_image.resize((disp_w, disp_h), Image.LANCZOS)
     photo = ImageTk.PhotoImage(display_image)
