@@ -272,10 +272,12 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
     init_scale = min(screen_w * 0.9 / orig_w, screen_h * 0.9 / orig_h, 1.0)
     init_w = int(orig_w * init_scale)
     init_h = int(orig_h * init_scale)
-    win.geometry(f"{init_w}x{init_h}")
-    win.state("normal")
-    win.attributes("-zoomed", False)  # Linux WMによる自動最大化を抑制
-    win.after(0, lambda: (win.state("normal"), win.attributes("-zoomed", False)))
+    # GNOME/X11 では geometry を after() で遅延設定しないと最大化が上書きされる
+    def _set_geometry():
+        win.state("normal")
+        win.attributes("-zoomed", False)
+        win.geometry(f"{init_w}x{init_h}")
+    win.after(100, _set_geometry)
 
     canvas = tk.Canvas(win, bg="#1e1e1e", highlightthickness=0)
     canvas.pack(fill=tk.BOTH, expand=True)
