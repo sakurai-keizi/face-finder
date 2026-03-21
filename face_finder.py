@@ -5,7 +5,7 @@
 #   "insightface",
 #   "pillow",
 #   "numpy",
-#   "onnxruntime",
+#   "onnxruntime-gpu",
 # ]
 # ///
 
@@ -383,7 +383,11 @@ def main():
 
     print("Loading InsightFace model...")
     face_app_lock = threading.Lock()
-    face_app = FaceAnalysis(providers=["CPUExecutionProvider"])
+    face_app = FaceAnalysis(providers=[
+        "TensorrtExecutionProvider",
+        "CUDAExecutionProvider",
+        "CPUExecutionProvider",
+    ])
     face_app.prepare(ctx_id=0, det_size=(640, 640))
 
     # スキャンをできるだけ早く開始（GUIより前）
