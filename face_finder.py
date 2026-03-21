@@ -273,7 +273,9 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
     init_w = int(orig_w * init_scale)
     init_h = int(orig_h * init_scale)
     win.geometry(f"{init_w}x{init_h}")
-    win.state("normal")  # 最大化を防ぐ
+    win.state("normal")
+    win.attributes("-zoomed", False)  # Linux WMによる自動最大化を抑制
+    win.after(0, lambda: (win.state("normal"), win.attributes("-zoomed", False)))
 
     canvas = tk.Canvas(win, bg="#1e1e1e", highlightthickness=0)
     canvas.pack(fill=tk.BOTH, expand=True)
