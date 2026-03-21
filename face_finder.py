@@ -339,6 +339,7 @@ def open_results_window(root, results: list[dict], query_face_idx: int,
     win = tk.Toplevel(root)
     win.title(f"Search results for Face #{query_face_idx + 1}  ({len(results)} match(es))")
     win.configure(bg="#1e1e1e")
+    win.state("normal")  # 最大化を防ぐ
 
     outer   = tk.Frame(win, bg="#1e1e1e")
     outer.pack(fill=tk.BOTH, expand=True)
