@@ -177,13 +177,18 @@ class DirectoryFaceDB:
         if on_complete:
             on_complete(len(self.records))
 
-    def search(self, query_emb: np.ndarray, threshold=SIMILARITY_THRESHOLD) -> list[dict]:
-        """画像ごとに最も類似度の高い顔を1件だけ返す（降順）。"""
+    def search(self, query_emb: np.ndarray, threshold=SIMILARITY_THRESHOLD,
+               exclude_path: Path | None = None) -> list[dict]:
+        """画像ごとに最も類似度の高い顔を1件だけ返す（降順）。
+        exclude_path が指定された場合、そのファイルは結果から除外する。"""
         q = query_emb / (np.linalg.norm(query_emb) + 1e-8)
+        exclude = exclude_path.resolve() if exclude_path else None
         best_per_image: dict[Path, dict] = {}
         with self._lock:
             records = list(self.records)
         for rec in records:
+            if exclude and rec["path"].resolve() == exclude:
+                continue
             e   = rec["face"].embedding
             e   = e / (np.linalg.norm(e) + 1e-8)
             sim = float(np.dot(q, e))
@@ -404,14 +409,18 @@ def open_results_window(root, results: list[dict], query_face_idx: int,
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: uv run face_finder.py <image_file> [search_directory]")
+        print("Usage: uv run face_finder.py <search_directory> [image_file]")
         sys.exit(1)
 
-    image_path = sys.argv[1]
-    search_dir = Path(sys.argv[2]) if len(sys.argv) >= 3 else None
+    search_dir = Path(sys.argv[1])
+    image_path = sys.argv[2] if len(sys.argv) >= 3 else None
 
-    if search_dir and not search_dir.is_dir():
+    if not search_dir.is_dir():
         print(f"Error: '{search_dir}' is not a directory")
+        sys.exit(1)
+
+    if image_path and not Path(image_path).is_file():
+        print(f"Error: '{image_path}' is not a file")
         sys.exit(1)
 
     trt_cache_dir = Path.home() / ".cache" / "face_finder" / "trt"
@@ -500,25 +509,32 @@ def main():
     root.mainloop()
 
 
-def _setup_main(root: tk.Tk, image_path: str, search_dir: Path | None, face_app):
+def _setup_main(root: tk.Tk, image_path: str | None, search_dir: Path, face_app):
     face_app_lock = threading.Lock()
     INFO_PANEL_W  = 320
+    PLACEHOLDER_W, PLACEHOLDER_H = 640, 480
 
-    # スキャンを即時開始
-    face_db: DirectoryFaceDB | None = None
-    if search_dir:
-        face_db = DirectoryFaceDB(search_dir, face_app, face_app_lock)
-        face_db.start_scan()
+    # スキャンを即時開始（search_dir は必須）
+    face_db = DirectoryFaceDB(search_dir, face_app, face_app_lock)
+    face_db.start_scan()
 
-    # メイン画像の顔検出
-    print("Detecting faces in main image...")
-    pil_image = Image.open(image_path).convert("RGB")
-    bgr_image = np.array(pil_image)[:, :, ::-1].copy()
-    with face_app_lock:
-        faces = face_app.get(bgr_image)
-    print(f"Found {len(faces)} face(s)")
+    # 現在表示中の画像ファイルパス（None = プレースホルダー表示中）
+    current_path: list[Path | None] = [None]
 
-    root.title(f"Face Finder - {image_path}")
+    # 初期画像の顔検出
+    if image_path:
+        print("Detecting faces in main image...")
+        pil_image = Image.open(image_path).convert("RGB")
+        bgr_image = np.array(pil_image)[:, :, ::-1].copy()
+        with face_app_lock:
+            faces = face_app.get(bgr_image)
+        print(f"Found {len(faces)} face(s)")
+        current_path[0] = Path(image_path)
+    else:
+        pil_image = None
+        faces     = []
+
+    root.title("Face Finder" if not image_path else f"Face Finder - {image_path}")
     root.resizable(True, True)
 
     screen_w = root.winfo_screenwidth()
@@ -528,30 +544,58 @@ def _setup_main(root: tk.Tk, image_path: str, search_dir: Path | None, face_app)
         w, h = img.size
         return min((screen_w - INFO_PANEL_W) * 0.95 / w, screen_h * 0.95 / h, 1.0)
 
-    scale  = _calc_scale(pil_image)
-    disp_w = int(pil_image.width  * scale)
-    disp_h = int(pil_image.height * scale)
+    if pil_image:
+        scale  = _calc_scale(pil_image)
+        init_w = int(pil_image.width  * scale)
+        init_h = int(pil_image.height * scale)
+    else:
+        scale  = 1.0
+        init_w = PLACEHOLDER_W
+        init_h = PLACEHOLDER_H
 
-    root.geometry(f"{disp_w + INFO_PANEL_W}x{disp_h}")
+    root.geometry(f"{init_w + INFO_PANEL_W}x{init_h}")
 
-    display_image = pil_image.resize((disp_w, disp_h), Image.LANCZOS)
-    photo = ImageTk.PhotoImage(display_image)
-
-    canvas = tk.Canvas(root, width=disp_w, height=disp_h, cursor="crosshair")
+    # キャンバス
+    canvas = tk.Canvas(root, width=init_w, height=init_h,
+                       bg="#1e1e1e", cursor="crosshair", highlightthickness=0)
     canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    canvas.create_image(0, 0, anchor=tk.NW, image=photo)
-    canvas.image = photo
 
     box_items: list = []
-    for face in faces:
-        x1, y1, x2, y2 = [c * scale for c in face.bbox]
-        box_items.append(canvas.create_rectangle(x1, y1, x2, y2, outline="lime", width=2))
 
+    def _draw_image(img: Image.Image, sc: float):
+        dw = int(img.width * sc)
+        dh = int(img.height * sc)
+        photo = ImageTk.PhotoImage(img.resize((dw, dh), Image.LANCZOS))
+        canvas.delete("all")
+        canvas.create_image(0, 0, anchor=tk.NW, image=photo)
+        canvas.image = photo  # GC防止
+        return photo
+
+    def _draw_placeholder():
+        canvas.delete("all")
+        canvas.config(width=PLACEHOLDER_W, height=PLACEHOLDER_H)
+        cw, ch = PLACEHOLDER_W, PLACEHOLDER_H
+        canvas.create_text(cw // 2, ch // 2,
+                           text="画像をここにドロップしてください",
+                           fill="#555555", font=("Helvetica", 18))
+
+    if pil_image:
+        _draw_image(pil_image, scale)
+        for face in faces:
+            x1, y1, x2, y2 = [c * scale for c in face.bbox]
+            box_items.append(canvas.create_rectangle(x1, y1, x2, y2, outline="lime", width=2))
+    else:
+        _draw_placeholder()
+
+    # 右パネル
     info_frame = tk.Frame(root, width=INFO_PANEL_W, bg="#1e1e1e")
     info_frame.pack(side=tk.RIGHT, fill=tk.Y)
     info_frame.pack_propagate(False)
 
-    header_var = tk.StringVar(value=f"{len(faces)} face(s) detected\nClick a face to inspect")
+    header_var = tk.StringVar(
+        value=f"{len(faces)} face(s) detected\nClick to inspect / search"
+              if pil_image else "画像をドロップして開始"
+    )
     tk.Label(info_frame, textvariable=header_var, bg="#1e1e1e", fg="#cccccc",
              font=("Helvetica", 11), justify=tk.CENTER).pack(pady=(12, 6))
 
@@ -561,26 +605,19 @@ def _setup_main(root: tk.Tk, image_path: str, search_dir: Path | None, face_app)
     )
     info_text.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
-    status_var = tk.StringVar(value="Ready")
+    status_var = tk.StringVar(value=f"Scanning {search_dir.name} ...")
     tk.Label(info_frame, textvariable=status_var, bg="#1e1e1e", fg="#888888",
              font=("Helvetica", 9)).pack(pady=4)
 
-    if face_db:
-        header_var.set(f"{len(faces)} face(s) detected\nClick to inspect / search")
+    def _poll_scan():
         if face_db.status == "done":
             status_var.set(f"Ready  ({len(face_db.records)} faces indexed)")
         else:
-            status_var.set(f"Scanning {search_dir.name} ...")
-
-            def _poll_scan():
-                if face_db.status == "done":
-                    status_var.set(f"Ready  ({len(face_db.records)} faces indexed)")
-                else:
-                    if face_db.total > 0:
-                        status_var.set(f"Scanning {face_db.scanned}/{face_db.total} ...")
-                    root.after(300, _poll_scan)
-
+            if face_db.total > 0:
+                status_var.set(f"Scanning {face_db.scanned}/{face_db.total} ...")
             root.after(300, _poll_scan)
+
+    root.after(300, _poll_scan)
 
     # ------------------------------------------------------------------ helpers
     def set_info(text):
@@ -596,37 +633,31 @@ def _setup_main(root: tk.Tk, image_path: str, search_dir: Path | None, face_app)
                               width=3 if i == idx else 2)
 
     def _apply_image(new_path: str, new_pil: Image.Image, new_faces: list):
-        """画像・顔リストを差し替えてキャンバスを更新する。"""
         nonlocal pil_image, faces, scale
 
-        pil_image = new_pil
-        faces     = new_faces
-        scale     = _calc_scale(new_pil)
+        pil_image        = new_pil
+        faces            = new_faces
+        scale            = _calc_scale(new_pil)
+        current_path[0]  = Path(new_path)
         dw = int(new_pil.width  * scale)
         dh = int(new_pil.height * scale)
 
         root.title(f"Face Finder - {new_path}")
         root.geometry(f"{dw + INFO_PANEL_W}x{dh}")
         canvas.config(width=dw, height=dh)
-
-        new_photo = ImageTk.PhotoImage(new_pil.resize((dw, dh), Image.LANCZOS))
-        canvas.delete("all")
-        canvas.create_image(0, 0, anchor=tk.NW, image=new_photo)
-        canvas.image = new_photo  # GC防止
+        _draw_image(new_pil, scale)
 
         box_items.clear()
         for face in faces:
             x1, y1, x2, y2 = [c * scale for c in face.bbox]
             box_items.append(canvas.create_rectangle(x1, y1, x2, y2, outline="lime", width=2))
 
-        n_label = "Click to inspect / search" if face_db else "Click a face to inspect"
-        header_var.set(f"{len(faces)} face(s) detected\n{n_label}")
+        header_var.set(f"{len(faces)} face(s) detected\nClick to inspect / search")
         set_info("")
 
     # ------------------------------------------------------------------ drag & drop
     def _on_drop(event):
         raw = event.data.strip()
-        # tkinterdnd2 はスペースを含むパスを {} で囲む
         if raw.startswith("{") and raw.endswith("}"):
             file_path = raw[1:-1]
         else:
@@ -647,7 +678,9 @@ def _setup_main(root: tk.Tk, image_path: str, search_dir: Path | None, face_app)
                     new_faces = face_app.get(new_bgr)
                 print(f"[Drop] Found {len(new_faces)} face(s)")
                 root.after(0, _apply_image, file_path, new_pil, new_faces)
-                root.after(0, status_var.set, "Ready")
+                root.after(0, status_var.set,
+                           f"Ready  ({len(face_db.records)} faces indexed)"
+                           if face_db.status == "done" else status_var.get())
             except Exception as e:
                 print(f"[Drop] Error: {e}")
                 root.after(0, status_var.set, f"エラー: {e}")
@@ -659,6 +692,9 @@ def _setup_main(root: tk.Tk, image_path: str, search_dir: Path | None, face_app)
 
     # ------------------------------------------------------------------ click
     def on_click(event):
+        if pil_image is None:
+            return
+
         orig_x = event.x / scale
         orig_y = event.y / scale
 
@@ -694,15 +730,22 @@ def _setup_main(root: tk.Tk, image_path: str, search_dir: Path | None, face_app)
             lines.append(f"\nEmbedding dim: {len(emb)}  norm: {np.linalg.norm(emb):.4f}\n")
         set_info("".join(lines))
 
-        if face_db and face.embedding is not None:
+        if face.embedding is not None:
             if face_db.status != "done":
                 status_var.set("Still scanning — please wait...")
                 return
             status_var.set("Searching...")
             query_emb = face.embedding.copy()
 
+            # クエリ画像が検索ディレクトリ内にある場合は除外
+            try:
+                current_path[0].resolve().relative_to(search_dir.resolve())
+                exclude = current_path[0]
+            except (ValueError, AttributeError):
+                exclude = None
+
             def do_search():
-                results = face_db.search(query_emb)
+                results = face_db.search(query_emb, exclude_path=exclude)
                 root.after(0, _show_results, results, clicked_idx, query_emb)
 
             threading.Thread(target=do_search, daemon=True).start()
