@@ -15,6 +15,12 @@
 # ///
 
 import sys
+import ctypes
+try:
+    ctypes.cdll.LoadLibrary("libX11.so.6").XInitThreads()
+except Exception:
+    pass
+
 import time
 import hashlib
 import pickle
