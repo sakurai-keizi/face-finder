@@ -484,7 +484,75 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
         import torch, traceback
         if sam2_ctx is None:
             return
-        # モードに応じてモデルを選択（large は遅延ロード）
+
+        x1, y1, x2, y2 = [int(c) for c in matched_bbox]
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        img_arr = np.array(pil_image)
+        fw, fh  = x2 - x1, y2 - y1
+
+        # SAM2 へ渡すデフォルト値（YOLO 失敗時フォールバック）
+        point_coords = [[cx, cy]]
+        point_labels = [1]
+        sam2_img     = img_arr
+        sam2_box     = [max(0, x1 - fw), max(0, y1 - int(fh * 0.5)),
+                        min(pil_image.width, x2 + fw),
+                        min(pil_image.height, y2 + int(fh * 6))]
+        crop_offset  = (0, 0)
+
+        # --- Phase 1: YOLO（SAM2 モデルロード前に全身 BBOX を即時表示）---
+        if sam2_ctx.yolo is not None:
+            try:
+                with sam2_ctx.lock:
+                    yolo_res = sam2_ctx.yolo(img_arr, verbose=False)
+                if yolo_res and yolo_res[0].keypoints is not None:
+                    boxes    = yolo_res[0].boxes.xyxy.cpu().numpy()
+                    kps_xy   = yolo_res[0].keypoints.xy.cpu().numpy()
+                    kps_conf = yolo_res[0].keypoints.conf
+                    if kps_conf is not None:
+                        kps_conf = kps_conf.cpu().numpy()
+                    # 顔中心点を含む人物 BBOX を優先、なければ最大オーバーラップ
+                    best_idx, best_overlap = -1, 0.0
+                    for i, (bx1_, by1_, bx2_, by2_) in enumerate(boxes):
+                        if bx1_ <= cx <= bx2_ and by1_ <= cy <= by2_:
+                            best_idx, best_overlap = i, 1.0
+                            break
+                        ix = max(0, min(x2, bx2_) - max(x1, bx1_))
+                        iy = max(0, min(y2, by2_) - max(y1, by1_))
+                        ov = ix * iy / max((x2-x1)*(y2-y1), 1)
+                        if ov > best_overlap:
+                            best_overlap, best_idx = ov, i
+                    if best_idx >= 0 and best_overlap > 0.1:
+                        bx1_, by1_, bx2_, by2_ = boxes[best_idx]
+                        body_bbox[0] = [bx1_, by1_, bx2_, by2_]
+                        win.after(0, _redraw)
+                        # キーポイントを前景点に
+                        kps  = kps_xy[best_idx]
+                        conf = kps_conf[best_idx] if kps_conf is not None \
+                               else np.ones(len(kps))
+                        valid = [(float(kp[0]), float(kp[1]))
+                                 for kp, c in zip(kps, conf)
+                                 if c > 0.3 and kp[0] > 0 and kp[1] > 0]
+                        if valid:
+                            point_coords = valid
+                            point_labels = [1] * len(valid)
+                        # 人物 BBOX を 10% 拡張して crop
+                        mx = (bx2_ - bx1_) * 0.1
+                        my = (by2_ - by1_) * 0.1
+                        ox = max(0, int(bx1_ - mx))
+                        oy = max(0, int(by1_ - my))
+                        ox2 = min(pil_image.width,  int(bx2_ + mx))
+                        oy2 = min(pil_image.height, int(by2_ + my))
+                        sam2_img    = img_arr[oy:oy2, ox:ox2]
+                        crop_offset = (ox, oy)
+                        point_coords = [(kpx - ox, kpy - oy)
+                                        for kpx, kpy in point_coords]
+                        sam2_box    = [bx1_ - ox, by1_ - oy,
+                                       bx2_ - ox, by2_ - oy]
+                        print(f"[YOLO] {len(valid)} kps, crop={sam2_img.shape[:2]}")
+            except Exception as e:
+                print(f"[YOLO] Error: {e}")
+
+        # --- Phase 2: SAM2 モデル選択（large は遅延ロード）---
         if current_mode[0] == "large":
             predictor = sam2_ctx.extra.get("large")
             if predictor is None:
@@ -505,70 +573,9 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
             predictor = sam2_ctx.predictor
         if predictor is None:
             return
-        x1, y1, x2, y2 = [int(c) for c in matched_bbox]
-        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-        img_arr = np.array(pil_image)
+
+        # --- Phase 3: SAM2 推論 ---
         try:
-            # --- YOLOv8 Pose でキーポイントと人物 BBOX を取得 ---
-            point_coords = [[cx, cy]]
-            point_labels = [1]
-            fw, fh = x2 - x1, y2 - y1
-            # YOLO 失敗時のフォールバック（全体画像・推定ボックス）
-            sam2_img  = img_arr
-            sam2_box  = [max(0, x1 - fw), max(0, y1 - int(fh * 0.5)),
-                         min(pil_image.width, x2 + fw),
-                         min(pil_image.height, y2 + int(fh * 6))]
-            crop_offset = (0, 0)
-
-            if sam2_ctx.yolo is not None:
-                with sam2_ctx.lock:
-                    yolo_res = sam2_ctx.yolo(img_arr, verbose=False)
-                if yolo_res and yolo_res[0].keypoints is not None:
-                    boxes    = yolo_res[0].boxes.xyxy.cpu().numpy()
-                    kps_xy   = yolo_res[0].keypoints.xy.cpu().numpy()
-                    kps_conf = yolo_res[0].keypoints.conf
-                    if kps_conf is not None:
-                        kps_conf = kps_conf.cpu().numpy()
-                    # 顔 BBOX と最もオーバーラップする人物を選ぶ
-                    best_idx, best_overlap = -1, 0.0
-                    for i, (bx1_, by1_, bx2_, by2_) in enumerate(boxes):
-                        ix = max(0, min(x2, bx2_) - max(x1, bx1_))
-                        iy = max(0, min(y2, by2_) - max(y1, by1_))
-                        overlap = ix * iy / max((x2-x1)*(y2-y1), 1)
-                        if overlap > best_overlap:
-                            best_overlap, best_idx = overlap, i
-                    if best_idx >= 0 and best_overlap > 0.3:
-                        bx1_, by1_, bx2_, by2_ = boxes[best_idx]
-                        # 全身 BBOX を保存して即時表示
-                        body_bbox[0] = [bx1_, by1_, bx2_, by2_]
-                        win.after(0, _redraw)
-                        # キーポイントを前景点に
-                        kps  = kps_xy[best_idx]
-                        conf = kps_conf[best_idx] if kps_conf is not None \
-                               else np.ones(len(kps))
-                        valid = [(float(kp[0]), float(kp[1]))
-                                 for kp, c in zip(kps, conf)
-                                 if c > 0.3 and kp[0] > 0 and kp[1] > 0]
-                        if valid:
-                            point_coords = valid
-                            point_labels = [1] * len(valid)
-                        # 人物 BBOX を 1.2倍拡張して crop
-                        mx = (bx2_ - bx1_) * 0.1
-                        my = (by2_ - by1_) * 0.1
-                        ox = max(0, int(bx1_ - mx))
-                        oy = max(0, int(by1_ - my))
-                        ox2 = min(pil_image.width,  int(bx2_ + mx))
-                        oy2 = min(pil_image.height, int(by2_ + my))
-                        sam2_img     = img_arr[oy:oy2, ox:ox2]
-                        crop_offset  = (ox, oy)
-                        # 座標を crop 基準に変換
-                        point_coords = [(kpx - ox, kpy - oy)
-                                        for kpx, kpy in point_coords]
-                        sam2_box     = [bx1_ - ox, by1_ - oy,
-                                        bx2_ - ox, by2_ - oy]
-                        print(f"[YOLO] {len(valid)} kps, crop={sam2_img.shape[:2]}")
-
-            # --- SAM2 推論 ---
             with sam2_ctx.lock:
                 with torch.inference_mode():
                     predictor.set_image(sam2_img)
