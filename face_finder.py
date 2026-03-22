@@ -10,6 +10,7 @@
 #   "sam2",
 #   "huggingface_hub",
 #   "ultralytics",
+#   "scipy",
 # ]
 # ///
 
@@ -380,7 +381,8 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                         box=np.array(box_prompt),
                         multimask_output=True,
                     )
-            seg_mask[0] = masks[scores.argmax()]
+            from scipy.ndimage import binary_fill_holes
+            seg_mask[0] = binary_fill_holes(masks[scores.argmax()])
             print(f"[SAM2] Segmentation done for {path.name}")
             win.after(0, _redraw)
         except Exception as e:
