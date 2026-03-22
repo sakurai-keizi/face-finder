@@ -520,6 +520,49 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
         command=_toggle_mode,
     ).pack(side=tk.RIGHT, padx=6, pady=4)
 
+    save_status = tk.StringVar(value="")
+    tk.Label(toolbar, textvariable=save_status,
+             bg="#2a2a2a", fg="#aaaaaa", font=("Helvetica", 9)).pack(side=tk.LEFT, padx=8)
+
+    def _save_segmentation():
+        if seg_mask[0] is None:
+            save_status.set("セマセグ取得前です")
+            return
+        mask = seg_mask[0]
+        if not mask.any():
+            save_status.set("マスクが空です")
+            return
+
+        # マスク領域を RGBA で切り出す
+        rgba = pil_image.convert("RGBA")
+        arr  = np.array(rgba)
+        arr[:, :, 3] = (mask.astype(np.uint8) * 255)
+        rows = np.where(mask.any(axis=1))[0]
+        cols = np.where(mask.any(axis=0))[0]
+        cropped = Image.fromarray(arr).crop(
+            (cols[0], rows[0], cols[-1] + 1, rows[-1] + 1)
+        )
+
+        # result ディレクトリに保存
+        result_dir = Path.cwd() / "result"
+        result_dir.mkdir(exist_ok=True)
+        stem = Path(path).stem
+        i = 1
+        while True:
+            out_path = result_dir / f"{stem}_seg_{i:03d}.png"
+            if not out_path.exists():
+                break
+            i += 1
+        cropped.save(out_path)
+        print(f"[Save] {out_path}")
+        save_status.set(f"保存: {out_path.name}")
+
+    tk.Button(
+        toolbar, text="保存",
+        bg="#226622", fg="white", relief=tk.FLAT, padx=10,
+        command=_save_segmentation,
+    ).pack(side=tk.LEFT, padx=6, pady=4)
+
     threading.Thread(target=_run_sam2, daemon=True).start()
 
 
