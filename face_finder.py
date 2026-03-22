@@ -324,6 +324,12 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
         x1, y1, x2, y2 = [int(c) for c in matched_bbox]
         cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
         try:
+            # 顔BBOXから全身を包む推定ボックスを生成
+            fw, fh = x2 - x1, y2 - y1
+            bx1 = max(0, x1 - fw)
+            bx2 = min(pil_image.width,  x2 + fw)
+            by1 = max(0, y1 - int(fh * 0.5))
+            by2 = min(pil_image.height, y2 + int(fh * 6))
             lock = sam2_lock if sam2_lock is not None else threading.Lock()
             with lock:
                 with torch.inference_mode():
@@ -331,6 +337,7 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                     masks, scores, _ = sam2_predictor.predict(
                         point_coords=np.array([[cx, cy]]),
                         point_labels=np.array([1]),
+                        box=np.array([bx1, by1, bx2, by2]),
                         multimask_output=True,
                     )
             seg_mask[0] = masks[scores.argmax()]
@@ -353,8 +360,8 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
             ).resize((disp_w, disp_h), Image.NEAREST)
             mask_arr = np.array(mask_img) > 128
             img_arr  = np.array(img).astype(np.float32)
-            teal     = np.array([0, 200, 255], dtype=np.float32)
-            img_arr[mask_arr] = img_arr[mask_arr] * 0.55 + teal * 0.45
+            yellow   = np.array([255, 220, 0], dtype=np.float32)
+            img_arr[mask_arr] = img_arr[mask_arr] * 0.55 + yellow * 0.45
             img = Image.fromarray(np.clip(img_arr, 0, 255).astype(np.uint8))
 
         draw = ImageDraw.Draw(img)
