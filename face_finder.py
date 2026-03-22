@@ -39,12 +39,17 @@ CACHE_VERSION        = 1
 
 
 def _setup_xdnd(root: tk.Tk, on_file_drop) -> bool:
-    """XDND ファイルドロップを python-xlib + プロキシウィンドウで受信する。
+    """XDND: Tk_CreateGenericHandler (ctypes) + python-xlib で実装。
 
-    tkinterdnd2 は libxcb を直接使うため Tkinter の Xlib 接続と競合するが、
-    こちらは別 Xlib 接続・1×1 プロキシウィンドウ経由で受信するため競合しない。
-    成功したら True を返す。
+    XdndPosition/XdndDrop は Tk の汎用イベントハンドラで捕捉。
+    選択データの取得は Tk 自身の selection get コマンドに委譲することで
+    convert_selection/SelectionNotify の待機によるデッドロックを回避。
+    XdndStatus/XdndFinished の送信は python-xlib の worker thread が担当。
     """
+    import ctypes
+    import ctypes.util as _cu
+    import glob as _glob
+    import queue as _queue
     try:
         from Xlib import X, display as _Xdisp, Xatom
         from Xlib.protocol import event as _Xevt
@@ -55,84 +60,127 @@ def _setup_xdnd(root: tk.Tk, on_file_drop) -> bool:
     root.update()
     tk_wid = root.winfo_id()
 
+    # python-xlib 専用接続 (XdndStatus/XdndFinished 送信専用・worker のみ使う)
     d = _Xdisp.Display()
     screen = d.screen()
 
-    proxy = screen.root.create_window(
-        0, 0, 1, 1, 0,
-        screen.root_depth,
-        X.InputOutput,
-        X.CopyFromParent,
-        event_mask=X.NoEventMask,
-    )
-
     XdndAware      = d.intern_atom('XdndAware')
-    XdndProxy      = d.intern_atom('XdndProxy')
     XdndPosition   = d.intern_atom('XdndPosition')
     XdndDrop       = d.intern_atom('XdndDrop')
     XdndStatus     = d.intern_atom('XdndStatus')
     XdndFinished   = d.intern_atom('XdndFinished')
-    XdndSelection  = d.intern_atom('XdndSelection')
     XdndActionCopy = d.intern_atom('XdndActionCopy')
-    uri_list       = d.intern_atom('text/uri-list')
-    xdnd_tmp       = d.intern_atom('_XDND_PROXY_TMP')
 
-    # XdndAware をプロキシ・本窓の両方に、XdndProxy をプロキシ自身と本窓に設定
-    proxy.change_property(XdndAware, Xatom.ATOM,   32, [5])
-    proxy.change_property(XdndProxy, Xatom.WINDOW, 32, [proxy.id])
+    # Tk ウィンドウと WM reparenting フレームに XdndAware (version 5) を設定
     tk_win = d.create_resource_object('window', tk_wid)
-    tk_win.change_property(XdndAware, Xatom.ATOM,   32, [5])
-    tk_win.change_property(XdndProxy, Xatom.WINDOW, 32, [proxy.id])
+    tk_win.change_property(XdndAware, Xatom.ATOM, 32, [5])
+    try:
+        parent = tk_win.query_tree().parent
+        if parent and parent.id != screen.root.id:
+            parent.change_property(XdndAware, Xatom.ATOM, 32, [5])
+    except Exception:
+        pass
     d.flush()
 
-    def _listen():
-        while True:
-            ev = d.next_event()
-            if ev.type != X.ClientMessage:
-                continue
+    # worker thread への指示キュー (status / finished のみ)
+    _q: _queue.SimpleQueue = _queue.SimpleQueue()
 
-            if ev.client_type == XdndPosition:
-                src = d.create_resource_object('window', ev.data.data[0])
+    def _worker():
+        while True:
+            msg = _q.get()
+            if msg is None:
+                break
+            kind = msg[0]
+            if kind == 'status':
+                src_id, tgt_id = msg[1], msg[2]
+                src = d.create_resource_object('window', src_id)
                 resp = _Xevt.ClientMessage(
                     window=src,
                     client_type=XdndStatus,
-                    data=(32, [tk_wid, 1, 0, 0, XdndActionCopy]),
+                    data=(32, [tgt_id, 1, 0, 0, XdndActionCopy]),
                 )
-                d.send_event(src, False, X.NoEventMask, resp)
+                src.send_event(resp, event_mask=X.NoEventMask)
                 d.flush()
-
-            elif ev.client_type == XdndDrop:
-                src_id = ev.data.data[0]
-                ts     = ev.data.data[2]
-                proxy.convert_selection(XdndSelection, uri_list, xdnd_tmp, ts)
-                d.flush()
-
-                paths = []
-                while True:
-                    sev = d.next_event()
-                    if sev.type == X.SelectionNotify:
-                        prop = proxy.get_full_property(xdnd_tmp, X.AnyPropertyType)
-                        if prop:
-                            raw = prop.value.tobytes().decode('utf-8', errors='ignore')
-                            for line in raw.strip().splitlines():
-                                line = line.strip()
-                                if line.startswith('file://'):
-                                    paths.append(unquote(line[7:]))
-                        break
-
-                for path in paths:
-                    root.after(0, on_file_drop, path)
-
+            elif kind == 'finished':
+                src_id, tgt_id, success = msg[1], msg[2], msg[3]
                 src = d.create_resource_object('window', src_id)
                 resp = _Xevt.ClientMessage(
                     window=src,
                     client_type=XdndFinished,
-                    data=(32, [tk_wid, 1 if paths else 0, XdndActionCopy, 0, 0]),
+                    data=(32, [tgt_id, success, XdndActionCopy if success else 0, 0, 0]),
                 )
-                d.send_event(src, False, X.NoEventMask, resp)
+                src.send_event(resp, event_mask=X.NoEventMask)
                 d.flush()
 
-    threading.Thread(target=_listen, daemon=True).start()
+    threading.Thread(target=_worker, daemon=True).start()
+
+    def _handle_drop(src_id, tgt_win):
+        """メインスレッドで XdndSelection を Tk の selection get で取得する。"""
+        paths = []
+        try:
+            raw = root.tk.call('selection', 'get',
+                               '-selection', 'XdndSelection',
+                               '-type', 'text/uri-list')
+            raw_str = str(raw).strip()
+            # Tk がバイナリデータを "0xHH 0xHH ..." 形式で返す場合はデコード
+            if raw_str.startswith('0x'):
+                raw_str = bytes(int(x, 16) for x in raw_str.split()).decode('utf-8', errors='replace')
+            for line in raw_str.splitlines():
+                line = line.strip()
+                if line and not line.startswith('#') and line.startswith('file://'):
+                    paths.append(unquote(line[7:]))
+        except Exception as e:
+            print(f"[DnD] selection get error: {e}")
+        for path in paths:
+            on_file_drop(path)
+        _q.put(('finished', src_id, tgt_win, 1 if paths else 0))
+
+    # XClientMessageEvent の x86_64 Linux オフセット (LP64):
+    #   type@0(int4)  serial@8(ulong8)  send_event@16(int4)  <pad4>
+    #   display@24(ptr8)  window@32(ulong8)  message_type@40(ulong8)
+    #   format@48(int4)  <pad4>  data.l[0..4]@56(long8 each)
+    _CLIENTMESSAGE = 33
+    _handler_proto = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+
+    def _generic_handler(_client_data, xevent_ptr):
+        try:
+            if xevent_ptr is None:
+                return 0
+            ev_type  = ctypes.c_int.from_address(xevent_ptr).value
+            if ev_type != _CLIENTMESSAGE:
+                return 0
+            tgt_win  = ctypes.c_ulong.from_address(xevent_ptr + 32).value
+            msg_type = ctypes.c_ulong.from_address(xevent_ptr + 40).value
+            src_id   = ctypes.c_long.from_address(xevent_ptr + 56).value
+            if msg_type == XdndPosition:
+                _q.put(('status', src_id, tgt_win))
+            elif msg_type == XdndDrop:
+                root.after(0, _handle_drop, src_id, tgt_win)
+        except Exception as e:
+            print(f"[DnD] handler error: {e}")
+        return 0
+
+    _handler_cb = _handler_proto(_generic_handler)
+
+    try:
+        _tklib_name = _cu.find_library('tk8.6') or _cu.find_library('tk')
+        if _tklib_name is None:
+            candidates = (_glob.glob('/usr/lib/x86_64-linux-gnu/libtk*.so*') +
+                          _glob.glob('/usr/lib/libtk*.so*') +
+                          _glob.glob('/usr/local/lib/libtk*.so*'))
+            _tklib_name = candidates[0] if candidates else None
+        if _tklib_name is None:
+            raise RuntimeError("libtk が見つかりません")
+        libtk = ctypes.CDLL(_tklib_name)
+        libtk.Tk_CreateGenericHandler.restype  = None
+        libtk.Tk_CreateGenericHandler.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        libtk.Tk_CreateGenericHandler(_handler_cb, None)
+        print(f"[DnD] ready — tk_wid={tk_wid:#x}")
+    except Exception as e:
+        print(f"[DnD] Tk_CreateGenericHandler 失敗: {e}")
+        return False
+
+    root._xdnd_handler_cb = _handler_cb
     return True
 
 
