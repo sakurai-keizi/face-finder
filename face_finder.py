@@ -693,133 +693,70 @@ def main():
     trt_cache_dir = Path.home() / ".cache" / "face_finder" / "trt"
     trt_cache_dir.mkdir(parents=True, exist_ok=True)
 
-    trt_available  = "TensorrtExecutionProvider" in onnxruntime.get_available_providers()
+    trt_available   = "TensorrtExecutionProvider" in onnxruntime.get_available_providers()
     trt_needs_build = trt_available and not any(trt_cache_dir.glob("*.engine"))
 
-    # --- ローディング画面（GUI を先に起動）---
-    root = TkinterDnD.Tk()
-    root.title("Face Finder - 初期化中")
-    root.configure(bg="#1e1e1e")
-    root.resizable(False, False)
-
-    load_frame = tk.Frame(root, bg="#1e1e1e", padx=48, pady=36)
-    load_frame.pack()
-
+    # --- モデルを GUI 起動前にメインスレッドで読み込む ---
+    # （バックグラウンドスレッドで onnxruntime-gpu / PyTorch を初期化すると
+    #   X11 の XInitThreads 競合で XCB が abort するため）
     if trt_needs_build:
-        title_text  = "TensorRT エンジンを初回ビルド中"
-        detail_text = "初回起動時のみ数分かかります。\n次回以降はキャッシュが使われ数秒で起動します。"
         print("[Init] TensorRT engine build required (first run). This may take several minutes.")
     elif trt_available:
-        title_text  = "TensorRT エンジンを読み込み中"
-        detail_text = "しばらくお待ちください。"
         print("[Init] Loading TensorRT engine from cache.")
     else:
-        title_text  = "InsightFace モデルを読み込み中"
-        detail_text = "しばらくお待ちください。"
         print("[Init] Loading InsightFace model.")
-
-    tk.Label(load_frame, text=title_text, bg="#1e1e1e", fg="white",
-             font=("Helvetica", 14, "bold")).pack(pady=(0, 8))
-    tk.Label(load_frame, text=detail_text, bg="#1e1e1e", fg="#aaaaaa",
-             font=("Helvetica", 10), justify=tk.CENTER).pack(pady=(0, 20))
-
-    style = ttk.Style(root)
-    style.theme_use("default")
-    style.configure("dark.Horizontal.TProgressbar",
-                    troughcolor="#2d2d2d", background="#4a9eff", borderwidth=0)
-    progress = ttk.Progressbar(load_frame, mode="indeterminate", length=320,
-                               style="dark.Horizontal.TProgressbar")
-    progress.pack(pady=(0, 14))
-    progress.start(40)
-
-    elapsed_var = tk.StringVar(value="経過: 0 秒")
-    tk.Label(load_frame, textvariable=elapsed_var, bg="#1e1e1e", fg="#666666",
-             font=("Helvetica", 9)).pack()
-
-    root.geometry("420x220")
-    root.update()
 
     start_time = time.time()
 
-    def _tick():
-        elapsed = int(time.time() - start_time)
-        elapsed_var.set(f"経過: {elapsed} 秒")
-        root.after(1000, _tick)
+    face_app = FaceAnalysis(providers=[
+        ("TensorrtExecutionProvider", {
+            "trt_engine_cache_enable": True,
+            "trt_engine_cache_path":   str(trt_cache_dir),
+        }),
+        "CUDAExecutionProvider",
+        "CPUExecutionProvider",
+    ])
+    face_app.prepare(ctx_id=0, det_size=(640, 640))
 
-    root.after(1000, _tick)
-
-    # --- バックグラウンドで InsightFace 初期化 ---
-    init_result: dict = {}
-
-    def _do_init():
-        face_app = FaceAnalysis(providers=[
-            ("TensorrtExecutionProvider", {
-                "trt_engine_cache_enable": True,
-                "trt_engine_cache_path":   str(trt_cache_dir),
-            }),
-            "CUDAExecutionProvider",
-            "CPUExecutionProvider",
-        ])
-        face_app.prepare(ctx_id=0, det_size=(640, 640))
-        init_result["face_app"] = face_app
-
-        try:
-            from sam2.sam2_image_predictor import SAM2ImagePredictor
-            # onnxruntime-gpu と PyTorch の CUDA コンテキスト競合を避けるため CPU で動作
-            print("[Init] Loading SAM2 model (CPU)...")
-            sam2 = SAM2ImagePredictor.from_pretrained(
-                "facebook/sam2.1-hiera-small", device="cpu"
-            )
-            init_result["sam2_predictor"] = sam2
-            print("[Init] SAM2 loaded (CPU)")
-        except Exception as e:
-            import traceback
-            print(f"[Init] SAM2 not available: {e}")
-            traceback.print_exc()
-            init_result["sam2_predictor"] = None
-
-        try:
-            from ultralytics import YOLO
-            print("[Init] Loading YOLOv8 Pose model (CPU)...")
-            yolo = YOLO("yolov8n-pose.pt")
-            yolo.to("cpu")
-            init_result["yolo_model"] = yolo
-            print("[Init] YOLOv8 Pose loaded (CPU)")
-        except Exception as e:
-            import traceback
-            print(f"[Init] YOLOv8 Pose not available: {e}")
-            traceback.print_exc()
-            init_result["yolo_model"] = None
-
-        root.after(0, _on_init_done)
-
-    threading.Thread(target=_do_init, daemon=True).start()
-
-    def _on_init_done():
-        elapsed = time.time() - start_time
-        print(f"[Init] Done in {elapsed:.1f}s")
-        progress.stop()
-        load_frame.destroy()
-
-        if init_result.get("sam2_predictor") is None:
-            from tkinter import messagebox
-            messagebox.showerror(
-                "初期化エラー",
-                "SAM2 モデルの読み込みに失敗しました。\n"
-                "ターミナルのエラーログを確認してください。"
-            )
-            root.destroy()
-            return
-
-        sam2_ctx = SAM2Context(
-            predictor=init_result["sam2_predictor"],
-            lock=threading.Lock(),
-            extra={"large": None},
-            yolo=init_result.get("yolo_model"),
+    try:
+        from sam2.sam2_image_predictor import SAM2ImagePredictor
+        print("[Init] Loading SAM2 model (CPU)...")
+        sam2_predictor = SAM2ImagePredictor.from_pretrained(
+            "facebook/sam2.1-hiera-small", device="cpu"
         )
-        _setup_main(root, image_path, search_dir, init_result["face_app"],
-                    sam2_ctx=sam2_ctx)
+        print("[Init] SAM2 loaded (CPU)")
+    except Exception as e:
+        print(f"[Init] SAM2 not available: {e}")
+        traceback.print_exc()
+        print("Error: SAM2 モデルの読み込みに失敗しました。ターミナルのエラーログを確認してください。")
+        sys.exit(1)
 
+    try:
+        from ultralytics import YOLO
+        print("[Init] Loading YOLOv8 Pose model (CPU)...")
+        yolo_model = YOLO("yolov8n-pose.pt")
+        yolo_model.to("cpu")
+        print("[Init] YOLOv8 Pose loaded (CPU)")
+    except Exception as e:
+        print(f"[Init] YOLOv8 Pose not available: {e}")
+        traceback.print_exc()
+        yolo_model = None
+
+    print(f"[Init] Done in {time.time() - start_time:.1f}s")
+
+    sam2_ctx = SAM2Context(
+        predictor=sam2_predictor,
+        lock=threading.Lock(),
+        extra={"large": None},
+        yolo=yolo_model,
+    )
+
+    # --- GUI 起動 ---
+    root = TkinterDnD.Tk()
+    root.title("Face Finder")
+    root.configure(bg="#1e1e1e")
+
+    _setup_main(root, image_path, search_dir, face_app, sam2_ctx=sam2_ctx)
     root.mainloop()
 
 
