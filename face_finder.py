@@ -6,7 +6,7 @@
 #   "pillow",
 #   "numpy",
 #   "onnxruntime-gpu",
-#   "tkinterdnd2",
+#   # tkinterdnd2 は libxcb を直接使用するため Tkinter (Xlib) と XCB 競合が発生する。
 #   "sam2",
 #   "huggingface_hub",
 #   "ultralytics",
@@ -22,23 +22,11 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 import tkinter as tk
-from tkinter import scrolledtext, ttk
+from tkinter import scrolledtext, ttk, filedialog
 import numpy as np
 from PIL import Image, ImageTk, ImageDraw
 from insightface.app import FaceAnalysis
 import onnxruntime
-from tkinterdnd2 import TkinterDnD, DND_FILES
-
-# tkinterdnd2 の既知バグ: DnD完了後にソースウィンドウへ XdndFinished を
-# 送り返す際、そのウィンドウが既に破棄されていると BadWindow エラーが出る。
-# X11 エラーハンドラを上書きして無視する。
-try:
-    import ctypes
-    _xlib = ctypes.CDLL("libX11.so.6")
-    _X_ERROR_HANDLER = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
-    _xlib.XSetErrorHandler(_X_ERROR_HANDLER(lambda d, e: 0))
-except Exception:
-    pass
 
 
 IMAGE_EXTENSIONS    = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
@@ -691,7 +679,7 @@ def main():
     trt_needs_build = trt_available and not any(trt_cache_dir.glob("*.engine"))
 
     # --- ローディング画面（GUI を先に起動）---
-    root = TkinterDnD.Tk()
+    root = tk.Tk()
     root.title("Face Finder - 初期化中")
     root.configure(bg="#1e1e1e")
     root.resizable(False, False)
@@ -911,6 +899,10 @@ def _setup_main(root: tk.Tk, image_path: str | None, search_dir: Path, face_app,
     )
     info_text.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
+    tk.Button(info_frame, text="画像を開く...", command=lambda: _on_open_button(),
+              bg="#3a3a3a", fg="white", activebackground="#555555",
+              relief=tk.FLAT, padx=10, pady=4).pack(pady=(0, 4))
+
     status_var = tk.StringVar(value=f"Scanning {search_dir.name} ...")
     tk.Label(info_frame, textvariable=status_var, bg="#1e1e1e", fg="#888888",
              font=("Helvetica", 9)).pack(pady=4)
@@ -961,20 +953,14 @@ def _setup_main(root: tk.Tk, image_path: str | None, search_dir: Path, face_app,
         header_var.set(f"{len(faces)} face(s) detected\nClick to inspect / search")
         set_info("")
 
-    # ------------------------------------------------------------------ drag & drop
-    def _on_drop(event):
-        raw = event.data.strip()
-        if raw.startswith("{") and raw.endswith("}"):
-            file_path = raw[1:-1]
-        else:
-            file_path = raw.split()[0]
-
+    # ------------------------------------------------------------------ ファイルを開く
+    def _load_file(file_path: str):
         if Path(file_path).suffix.lower() not in IMAGE_EXTENSIONS:
             status_var.set("対応していないファイル形式です")
             return
 
         status_var.set("読み込み中 ...")
-        print(f"[Drop] {file_path}")
+        print(f"[Open] {file_path}")
 
         def _detect():
             try:
@@ -982,19 +968,26 @@ def _setup_main(root: tk.Tk, image_path: str | None, search_dir: Path, face_app,
                 new_bgr = np.array(new_pil)[:, :, ::-1].copy()
                 with face_app_lock:
                     new_faces = face_app.get(new_bgr)
-                print(f"[Drop] Found {len(new_faces)} face(s)")
+                print(f"[Open] Found {len(new_faces)} face(s)")
                 root.after(0, _apply_image, file_path, new_pil, new_faces)
                 root.after(0, status_var.set,
                            f"Ready  ({len(face_db.records)} faces indexed)"
                            if face_db.status == "done" else status_var.get())
             except Exception as e:
-                print(f"[Drop] Error: {e}")
+                print(f"[Open] Error: {e}")
                 root.after(0, status_var.set, f"エラー: {e}")
 
         threading.Thread(target=_detect, daemon=True).start()
 
-    canvas.drop_target_register(DND_FILES)
-    canvas.dnd_bind("<<Drop>>", _on_drop)
+    def _on_open_button():
+        file_path = filedialog.askopenfilename(
+            title="画像を選択",
+            filetypes=[("画像ファイル", " ".join(f"*{e}" for e in IMAGE_EXTENSIONS)),
+                       ("すべてのファイル", "*.*")]
+        )
+        if file_path:
+            _load_file(file_path)
+
 
     # ------------------------------------------------------------------ click
     def on_click(event):
