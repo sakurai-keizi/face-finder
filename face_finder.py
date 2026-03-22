@@ -728,6 +728,32 @@ def main():
         print(f"Error: '{image_path}' is not a file")
         sys.exit(1)
 
+    # X11 競合回避: PyTorch をインポートするとバックグラウンド C++ スレッドが起動し、
+    # それらが X11 へアクセスするケースがある。TkinterDnD.Tk() を先に呼んで
+    # X11 コネクションを確立しておくと、後から起動するスレッドと競合しない。
+    root = TkinterDnD.Tk()
+    root.title("Face Finder - 初期化中")
+    root.configure(bg="#1e1e1e")
+    root.resizable(False, False)
+
+    load_frame = tk.Frame(root, bg="#1e1e1e", padx=48, pady=32)
+    load_frame.pack()
+    tk.Label(load_frame, text="モデルを読み込み中...", bg="#1e1e1e", fg="white",
+             font=("Helvetica", 14, "bold")).pack(pady=(0, 8))
+    detail_var = tk.StringVar(value="InsightFace")
+    tk.Label(load_frame, textvariable=detail_var, bg="#1e1e1e", fg="#aaaaaa",
+             font=("Helvetica", 10)).pack(pady=(0, 16))
+    style = ttk.Style(root)
+    style.theme_use("default")
+    style.configure("dark.Horizontal.TProgressbar",
+                    troughcolor="#2d2d2d", background="#4a9eff", borderwidth=0)
+    progress = ttk.Progressbar(load_frame, mode="indeterminate", length=280,
+                               style="dark.Horizontal.TProgressbar")
+    progress.pack()
+    progress.start(40)
+    root.geometry("380x180")
+    root.update()
+
     start_time = time.time()
 
     gpu_enabled = bool(os.environ.get("FACE_FINDER_GPU"))
@@ -737,6 +763,8 @@ def main():
         trt_available   = "TensorrtExecutionProvider" in onnxruntime.get_available_providers()
         trt_needs_build = trt_available and not any(trt_cache_dir.glob("*.engine"))
         if trt_needs_build:
+            detail_var.set("TensorRT エンジンをビルド中（数分かかります）")
+            root.update()
             print("[Init] TensorRT engine build required (first run). This may take several minutes.")
         elif trt_available:
             print("[Init] Loading TensorRT engine from cache.")
@@ -751,12 +779,13 @@ def main():
             "CPUExecutionProvider",
         ]
     else:
-        print("[Init] Loading InsightFace model (CPU).")
         providers = ["CPUExecutionProvider"]
 
     face_app = FaceAnalysis(providers=providers)
     face_app.prepare(ctx_id=0, det_size=(640, 640))
 
+    detail_var.set("SAM2")
+    root.update()
     try:
         from sam2.sam2_image_predictor import SAM2ImagePredictor
         print("[Init] Loading SAM2 model (CPU)...")
@@ -767,9 +796,17 @@ def main():
     except Exception as e:
         print(f"[Init] SAM2 not available: {e}")
         traceback.print_exc()
-        print("Error: SAM2 モデルの読み込みに失敗しました。ターミナルのエラーログを確認してください。")
+        from tkinter import messagebox
+        messagebox.showerror(
+            "初期化エラー",
+            "SAM2 モデルの読み込みに失敗しました。\n"
+            "ターミナルのエラーログを確認してください。"
+        )
+        root.destroy()
         sys.exit(1)
 
+    detail_var.set("YOLOv8 Pose")
+    root.update()
     try:
         from ultralytics import YOLO
         print("[Init] Loading YOLOv8 Pose model (CPU)...")
@@ -781,23 +818,18 @@ def main():
         traceback.print_exc()
         yolo_model = None
 
-    # --- GPU スレッドのウォームアップ（Tk / X11 起動前）---
-    # onnxruntime-gpu は初回実行スレッドで CUDA コンテキストを作成する際に
-    # NVIDIA ドライバ経由で X11 ディスプレイを参照することがある。
-    gpu_runner = GPUTaskRunner()
+    progress.stop()
+    load_frame.destroy()
+    root.resizable(True, True)
     print(f"[Init] Done in {time.time() - start_time:.1f}s")
 
+    gpu_runner = GPUTaskRunner()
     sam2_ctx = SAM2Context(
         predictor=sam2_predictor,
         lock=threading.Lock(),
         extra={"large": None},
         yolo=yolo_model,
     )
-
-    # --- GUI 起動 ---
-    root = TkinterDnD.Tk()
-    root.title("Face Finder")
-    root.configure(bg="#1e1e1e")
 
     _setup_main(root, image_path, search_dir, face_app,
                 gpu_runner=gpu_runner, sam2_ctx=sam2_ctx)
