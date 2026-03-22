@@ -463,8 +463,9 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
     canvas = tk.Canvas(win, bg="#1e1e1e", highlightthickness=0)
     canvas.pack(fill=tk.BOTH, expand=True)
 
-    # SAM2 セグメンテーションマスク（バックグラウンドで取得）
-    seg_mask: list[np.ndarray | None] = [None]
+    # セグメンテーションマスク（保存用）・全身 BBOX（表示用）
+    seg_mask:  list[np.ndarray | None] = [None]
+    body_bbox: list[list | None]       = [None]
     current_mode = ["large"]  # "small" | "large"
 
     def _run_sam2():
@@ -526,6 +527,9 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                             best_overlap, best_idx = overlap, i
                     if best_idx >= 0 and best_overlap > 0.3:
                         bx1_, by1_, bx2_, by2_ = boxes[best_idx]
+                        # 全身 BBOX を保存して即時表示
+                        body_bbox[0] = [bx1_, by1_, bx2_, by2_]
+                        win.after(0, _redraw)
                         # キーポイントを前景点に
                         kps  = kps_xy[best_idx]
                         conf = kps_conf[best_idx] if kps_conf is not None \
@@ -585,19 +589,12 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
         disp_w = int(orig_w * scale)
         disp_h = int(orig_h * scale)
         img  = pil_image.resize((disp_w, disp_h), Image.LANCZOS).copy()
-
-        # SAM2 マスクオーバーレイ（シアン半透明）
-        if seg_mask[0] is not None:
-            mask_img = Image.fromarray(
-                (seg_mask[0].astype(np.uint8) * 255)
-            ).resize((disp_w, disp_h), Image.NEAREST)
-            mask_arr = np.array(mask_img) > 128
-            img_arr  = np.array(img).astype(np.float32)
-            yellow   = np.array([255, 220, 0], dtype=np.float32)
-            img_arr[mask_arr] = img_arr[mask_arr] * 0.55 + yellow * 0.45
-            img = Image.fromarray(np.clip(img_arr, 0, 255).astype(np.uint8))
-
         draw = ImageDraw.Draw(img)
+
+        # 全身 BBOX（YOLO 検出結果）
+        if body_bbox[0] is not None:
+            bx1, by1, bx2, by2 = [c * scale for c in body_bbox[0]]
+            draw.rectangle([bx1, by1, bx2, by2], outline="#00ccff", width=max(2, int(2 * scale)))
 
         # 点線BBOX: 有り得そうな他の顔
         if face_db is not None and query_emb is not None:
@@ -613,10 +610,9 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                     draw_dashed_rect(draw, [sx1, sy1, sx2, sy2],
                                      color="orange", width=max(2, int(2 * scale)), dash=10)
 
-        # 実線BBOX: マスク未取得中のみ表示
-        if seg_mask[0] is None:
-            x1, y1, x2, y2 = [c * scale for c in matched_bbox]
-            draw.rectangle([x1, y1, x2, y2], outline="yellow", width=max(2, int(3 * scale)))
+        # 顔 BBOX（黄色実線・常時表示）
+        x1, y1, x2, y2 = [c * scale for c in matched_bbox]
+        draw.rectangle([x1, y1, x2, y2], outline="yellow", width=max(2, int(3 * scale)))
         return img
 
     photo_ref   = [None]
@@ -646,14 +642,13 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
 
     canvas.bind("<Configure>", _on_resize)
 
-    mode_label = tk.StringVar(value="標準モードへ切替")
+    mode_label = tk.StringVar(value="保存: 標準モードへ切替")
 
     def _toggle_mode():
         new_mode = "large" if current_mode[0] == "small" else "small"
         current_mode[0] = new_mode
-        mode_label.set("標準モードへ切替" if new_mode == "large" else "高精度モードへ切替")
+        mode_label.set("保存: 標準モードへ切替" if new_mode == "large" else "保存: 高精度モードへ切替")
         seg_mask[0] = None
-        _redraw()
         threading.Thread(target=_run_sam2, daemon=True).start()
 
     tk.Button(
