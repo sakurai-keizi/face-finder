@@ -623,6 +623,8 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
     resize_after = [None]
 
     def _redraw(event=None):
+        if not canvas.winfo_exists():
+            return
         cw = canvas.winfo_width()
         ch = canvas.winfo_height()
         if cw <= 1 or ch <= 1:
