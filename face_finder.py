@@ -603,8 +603,19 @@ def main():
         print(f"[Init] Done in {elapsed:.1f}s")
         progress.stop()
         load_frame.destroy()
+
+        if init_result.get("sam2_predictor") is None:
+            from tkinter import messagebox
+            messagebox.showerror(
+                "初期化エラー",
+                "SAM2 モデルの読み込みに失敗しました。\n"
+                "ターミナルのエラーログを確認してください。"
+            )
+            root.destroy()
+            return
+
         _setup_main(root, image_path, search_dir, init_result["face_app"],
-                    sam2_predictor=init_result.get("sam2_predictor"))
+                    sam2_predictor=init_result["sam2_predictor"])
 
     root.mainloop()
 
