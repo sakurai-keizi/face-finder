@@ -610,9 +610,6 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                     draw_dashed_rect(draw, [sx1, sy1, sx2, sy2],
                                      color="orange", width=max(2, int(2 * scale)), dash=10)
 
-        # 顔 BBOX（黄色実線・常時表示）
-        x1, y1, x2, y2 = [c * scale for c in matched_bbox]
-        draw.rectangle([x1, y1, x2, y2], outline="yellow", width=max(2, int(3 * scale)))
         return img
 
     photo_ref   = [None]
