@@ -545,12 +545,18 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                 break
             i += 1
 
-        # セマセグ結果: マスク領域を RGBA で切り出す
-        rgba = pil_image.convert("RGBA")
-        arr  = np.array(rgba)
-        arr[:, :, 3] = (mask.astype(np.uint8) * 255)
+        # セマセグ結果: 輪郭を5%膨張してからRGBAで切り出す
+        from scipy.ndimage import binary_dilation
         rows = np.where(mask.any(axis=1))[0]
         cols = np.where(mask.any(axis=0))[0]
+        radius = max(1, int(min(rows[-1] - rows[0], cols[-1] - cols[0]) * 0.05))
+        struct = np.ones((2 * radius + 1, 2 * radius + 1), dtype=bool)
+        dilated = binary_dilation(mask, structure=struct)
+        rgba = pil_image.convert("RGBA")
+        arr  = np.array(rgba)
+        arr[:, :, 3] = (dilated.astype(np.uint8) * 255)
+        rows = np.where(dilated.any(axis=1))[0]
+        cols = np.where(dilated.any(axis=0))[0]
         seg_img = Image.fromarray(arr).crop(
             (cols[0], rows[0], cols[-1] + 1, rows[-1] + 1)
         )
