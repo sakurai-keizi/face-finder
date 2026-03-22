@@ -354,24 +354,26 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
         cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
         img_arr = np.array(pil_image)
         try:
-            lock  = sam2_lock if sam2_lock is not None else threading.Lock()
+            lock = sam2_lock if sam2_lock is not None else threading.Lock()
+
             # --- YOLOv8 Pose でキーポイントと人物 BBOX を取得 ---
             point_coords = [[cx, cy]]
             point_labels = [1]
             fw, fh = x2 - x1, y2 - y1
-            box_prompt = [                          # YOLO 失敗時の推定ボックス
-                max(0, x1 - fw),
-                max(0, y1 - int(fh * 0.5)),
-                min(pil_image.width,  x2 + fw),
-                min(pil_image.height, y2 + int(fh * 6)),
-            ]
+            # YOLO 失敗時のフォールバック（全体画像・推定ボックス）
+            sam2_img  = img_arr
+            sam2_box  = [max(0, x1 - fw), max(0, y1 - int(fh * 0.5)),
+                         min(pil_image.width, x2 + fw),
+                         min(pil_image.height, y2 + int(fh * 6))]
+            crop_offset = (0, 0)
+
             if yolo_model is not None:
                 with lock:
                     yolo_res = yolo_model(img_arr, verbose=False)
                 if yolo_res and yolo_res[0].keypoints is not None:
-                    boxes = yolo_res[0].boxes.xyxy.cpu().numpy()
-                    kps_xy   = yolo_res[0].keypoints.xy.cpu().numpy()    # (N,17,2)
-                    kps_conf = yolo_res[0].keypoints.conf                 # None or (N,17)
+                    boxes    = yolo_res[0].boxes.xyxy.cpu().numpy()
+                    kps_xy   = yolo_res[0].keypoints.xy.cpu().numpy()
+                    kps_conf = yolo_res[0].keypoints.conf
                     if kps_conf is not None:
                         kps_conf = kps_conf.cpu().numpy()
                     # 顔 BBOX と最もオーバーラップする人物を選ぶ
@@ -383,8 +385,9 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                         if overlap > best_overlap:
                             best_overlap, best_idx = overlap, i
                     if best_idx >= 0 and best_overlap > 0.3:
-                        # 対象人物: 信頼度 0.3 超のキーポイントを前景点に
-                        kps = kps_xy[best_idx]
+                        bx1_, by1_, bx2_, by2_ = boxes[best_idx]
+                        # キーポイントを前景点に
+                        kps  = kps_xy[best_idx]
                         conf = kps_conf[best_idx] if kps_conf is not None \
                                else np.ones(len(kps))
                         valid = [(float(kp[0]), float(kp[1]))
@@ -393,22 +396,44 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                         if valid:
                             point_coords = valid
                             point_labels = [1] * len(valid)
-                        bx1_, by1_, bx2_, by2_ = boxes[best_idx]
-                        box_prompt = [float(bx1_), float(by1_),
-                                      float(bx2_), float(by2_)]
-                        print(f"[YOLO] {len(valid)} keypoints for SAM2")
+                        # 人物 BBOX を 1.2倍拡張して crop
+                        mx = (bx2_ - bx1_) * 0.1
+                        my = (by2_ - by1_) * 0.1
+                        ox = max(0, int(bx1_ - mx))
+                        oy = max(0, int(by1_ - my))
+                        ox2 = min(pil_image.width,  int(bx2_ + mx))
+                        oy2 = min(pil_image.height, int(by2_ + my))
+                        sam2_img     = img_arr[oy:oy2, ox:ox2]
+                        crop_offset  = (ox, oy)
+                        # 座標を crop 基準に変換
+                        point_coords = [(kpx - ox, kpy - oy)
+                                        for kpx, kpy in point_coords]
+                        sam2_box     = [bx1_ - ox, by1_ - oy,
+                                        bx2_ - ox, by2_ - oy]
+                        print(f"[YOLO] {len(valid)} kps, crop={sam2_img.shape[:2]}")
+
             # --- SAM2 推論 ---
             with lock:
                 with torch.inference_mode():
-                    predictor.set_image(img_arr)
-                    masks, scores, _ = sam2_predictor.predict(
+                    predictor.set_image(sam2_img)
+                    masks, scores, _ = predictor.predict(
                         point_coords=np.array(point_coords),
                         point_labels=np.array(point_labels),
-                        box=np.array(box_prompt),
+                        box=np.array(sam2_box),
                         multimask_output=True,
                     )
             from scipy.ndimage import binary_fill_holes
-            seg_mask[0] = binary_fill_holes(masks[scores.argmax()])
+            crop_mask = binary_fill_holes(masks[scores.argmax()])
+
+            # crop マスクを元画像サイズに展開
+            if crop_offset == (0, 0) and crop_mask.shape == (pil_image.height, pil_image.width):
+                seg_mask[0] = crop_mask
+            else:
+                full_mask = np.zeros((pil_image.height, pil_image.width), dtype=bool)
+                ox, oy = crop_offset
+                ch, cw = crop_mask.shape
+                full_mask[oy:oy+ch, ox:ox+cw] = crop_mask
+                seg_mask[0] = full_mask
             print(f"[SAM2] Segmentation done for {path.name}")
             win.after(0, _redraw)
         except Exception as e:
