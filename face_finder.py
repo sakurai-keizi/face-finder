@@ -6,7 +6,7 @@
 #   "pillow",
 #   "numpy",
 #   "onnxruntime-gpu",
-#   # tkinterdnd2 は libxcb を直接使用するため Tkinter (Xlib) と XCB 競合が発生する。
+#   "python-xlib",
 #   "sam2",
 #   "huggingface_hub",
 #   "ultralytics",
@@ -36,6 +36,104 @@ THUMB_SIZE           = 220
 RESULT_COLS          = 4
 CACHE_FILENAME       = ".face_finder_cache.pkl"
 CACHE_VERSION        = 1
+
+
+def _setup_xdnd(root: tk.Tk, on_file_drop) -> bool:
+    """XDND ファイルドロップを python-xlib + プロキシウィンドウで受信する。
+
+    tkinterdnd2 は libxcb を直接使うため Tkinter の Xlib 接続と競合するが、
+    こちらは別 Xlib 接続・1×1 プロキシウィンドウ経由で受信するため競合しない。
+    成功したら True を返す。
+    """
+    try:
+        from Xlib import X, display as _Xdisp, Xatom
+        from Xlib.protocol import event as _Xevt
+        from urllib.parse import unquote
+    except ImportError:
+        return False
+
+    root.update()
+    tk_wid = root.winfo_id()
+
+    d = _Xdisp.Display()
+    screen = d.screen()
+
+    proxy = screen.root.create_window(
+        0, 0, 1, 1, 0,
+        screen.root_depth,
+        X.InputOutput,
+        X.CopyFromParent,
+        event_mask=X.NoEventMask,
+    )
+
+    XdndAware      = d.intern_atom('XdndAware')
+    XdndProxy      = d.intern_atom('XdndProxy')
+    XdndPosition   = d.intern_atom('XdndPosition')
+    XdndDrop       = d.intern_atom('XdndDrop')
+    XdndStatus     = d.intern_atom('XdndStatus')
+    XdndFinished   = d.intern_atom('XdndFinished')
+    XdndSelection  = d.intern_atom('XdndSelection')
+    XdndActionCopy = d.intern_atom('XdndActionCopy')
+    uri_list       = d.intern_atom('text/uri-list')
+    xdnd_tmp       = d.intern_atom('_XDND_PROXY_TMP')
+
+    # XdndAware をプロキシ・本窓の両方に、XdndProxy をプロキシ自身と本窓に設定
+    proxy.change_property(XdndAware, Xatom.ATOM,   32, [5])
+    proxy.change_property(XdndProxy, Xatom.WINDOW, 32, [proxy.id])
+    tk_win = d.create_resource_object('window', tk_wid)
+    tk_win.change_property(XdndAware, Xatom.ATOM,   32, [5])
+    tk_win.change_property(XdndProxy, Xatom.WINDOW, 32, [proxy.id])
+    d.flush()
+
+    def _listen():
+        while True:
+            ev = d.next_event()
+            if ev.type != X.ClientMessage:
+                continue
+
+            if ev.client_type == XdndPosition:
+                src = d.create_resource_object('window', ev.data.data[0])
+                resp = _Xevt.ClientMessage(
+                    window=src,
+                    client_type=XdndStatus,
+                    data=(32, [tk_wid, 1, 0, 0, XdndActionCopy]),
+                )
+                d.send_event(src, False, X.NoEventMask, resp)
+                d.flush()
+
+            elif ev.client_type == XdndDrop:
+                src_id = ev.data.data[0]
+                ts     = ev.data.data[2]
+                proxy.convert_selection(XdndSelection, uri_list, xdnd_tmp, ts)
+                d.flush()
+
+                paths = []
+                while True:
+                    sev = d.next_event()
+                    if sev.type == X.SelectionNotify:
+                        prop = proxy.get_full_property(xdnd_tmp, X.AnyPropertyType)
+                        if prop:
+                            raw = prop.value.tobytes().decode('utf-8', errors='ignore')
+                            for line in raw.strip().splitlines():
+                                line = line.strip()
+                                if line.startswith('file://'):
+                                    paths.append(unquote(line[7:]))
+                        break
+
+                for path in paths:
+                    root.after(0, on_file_drop, path)
+
+                src = d.create_resource_object('window', src_id)
+                resp = _Xevt.ClientMessage(
+                    window=src,
+                    client_type=XdndFinished,
+                    data=(32, [tk_wid, 1 if paths else 0, XdndActionCopy, 0, 0]),
+                )
+                d.send_event(src, False, X.NoEventMask, resp)
+                d.flush()
+
+    threading.Thread(target=_listen, daemon=True).start()
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -870,7 +968,7 @@ def _setup_main(root: tk.Tk, image_path: str | None, search_dir: Path, face_app,
         canvas.config(width=PLACEHOLDER_W, height=PLACEHOLDER_H)
         cw, ch = PLACEHOLDER_W, PLACEHOLDER_H
         canvas.create_text(cw // 2, ch // 2,
-                           text="画像をここにドロップしてください",
+                           text="画像をドロップ または「画像を開く...」",
                            fill="#555555", font=("Helvetica", 18))
 
     if pil_image:
@@ -988,6 +1086,9 @@ def _setup_main(root: tk.Tk, image_path: str | None, search_dir: Path, face_app,
         if file_path:
             _load_file(file_path)
 
+    # XDND ドロップ受信（python-xlib 経由、tkinterdnd2 不要）
+    if not _setup_xdnd(root, _load_file):
+        print("[DnD] python-xlib が利用できません。ドラッグ&ドロップは無効です。")
 
     # ------------------------------------------------------------------ click
     def on_click(event):
