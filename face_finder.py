@@ -370,7 +370,6 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                         box_prompt = [float(bx1_), float(by1_),
                                       float(bx2_), float(by2_)]
                         # 他の人物: キーポイントを背景点に追加
-                        bg_count = 0
                         for i in range(len(boxes)):
                             if i == best_idx:
                                 continue
@@ -381,8 +380,18 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                                       if c > 0.3 and kp[0] > 0 and kp[1] > 0]
                             point_coords.extend(bg_kps)
                             point_labels.extend([0] * len(bg_kps))
-                            bg_count += len(bg_kps)
-                        print(f"[YOLO] {len(valid)} fg + {bg_count} bg keypoints")
+                        # 前景点と背景点を同数に揃える（人物BBOX中心線上でサンプリング）
+                        fg_count = point_labels.count(1)
+                        bg_count = point_labels.count(0)
+                        if bg_count > fg_count:
+                            needed = bg_count - fg_count
+                            bx_c = (bx1_ + bx2_) / 2.0
+                            for j in range(1, needed + 1):
+                                py = float(by1_) + (float(by2_) - float(by1_)) \
+                                     * j / (needed + 1)
+                                point_coords.append((bx_c, py))
+                                point_labels.append(1)
+                        print(f"[YOLO] fg={point_labels.count(1)} bg={point_labels.count(0)}")
             # --- SAM2 推論 ---
             with lock:
                 with torch.inference_mode():
