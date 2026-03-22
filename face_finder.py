@@ -9,6 +9,7 @@
 #   "tkinterdnd2",
 #   "sam2",
 #   "huggingface_hub",
+#   "ultralytics",
 # ]
 # ///
 
@@ -291,7 +292,8 @@ def make_face_thumb(pil_image: Image.Image, bbox, thumb_size=THUMB_SIZE) -> Imag
 def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                      face_db: "DirectoryFaceDB | None" = None,
                      query_emb: "np.ndarray | None" = None,
-                     sam2_predictor=None, sam2_lock: "threading.Lock | None" = None):
+                     sam2_predictor=None, sam2_lock: "threading.Lock | None" = None,
+                     yolo_model=None):
     win = tk.Toplevel(root)
     win.title(str(path))
     win.configure(bg="#1e1e1e")
@@ -323,21 +325,59 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
         import torch, traceback
         x1, y1, x2, y2 = [int(c) for c in matched_bbox]
         cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        img_arr = np.array(pil_image)
         try:
-            # 顔BBOXから全身を包む推定ボックスを生成
+            lock  = sam2_lock if sam2_lock is not None else threading.Lock()
+            # --- YOLOv8 Pose でキーポイントと人物 BBOX を取得 ---
+            point_coords = [[cx, cy]]
+            point_labels = [1]
             fw, fh = x2 - x1, y2 - y1
-            bx1 = max(0, x1 - fw)
-            bx2 = min(pil_image.width,  x2 + fw)
-            by1 = max(0, y1 - int(fh * 0.5))
-            by2 = min(pil_image.height, y2 + int(fh * 6))
-            lock = sam2_lock if sam2_lock is not None else threading.Lock()
+            box_prompt = [                          # YOLO 失敗時の推定ボックス
+                max(0, x1 - fw),
+                max(0, y1 - int(fh * 0.5)),
+                min(pil_image.width,  x2 + fw),
+                min(pil_image.height, y2 + int(fh * 6)),
+            ]
+            if yolo_model is not None:
+                with lock:
+                    yolo_res = yolo_model(img_arr, verbose=False)
+                if yolo_res and yolo_res[0].keypoints is not None:
+                    boxes = yolo_res[0].boxes.xyxy.cpu().numpy()
+                    kps_xy   = yolo_res[0].keypoints.xy.cpu().numpy()    # (N,17,2)
+                    kps_conf = yolo_res[0].keypoints.conf                 # None or (N,17)
+                    if kps_conf is not None:
+                        kps_conf = kps_conf.cpu().numpy()
+                    # 顔 BBOX と最もオーバーラップする人物を選ぶ
+                    best_idx, best_overlap = -1, 0.0
+                    for i, (bx1_, by1_, bx2_, by2_) in enumerate(boxes):
+                        ix = max(0, min(x2, bx2_) - max(x1, bx1_))
+                        iy = max(0, min(y2, by2_) - max(y1, by1_))
+                        overlap = ix * iy / max((x2-x1)*(y2-y1), 1)
+                        if overlap > best_overlap:
+                            best_overlap, best_idx = overlap, i
+                    if best_idx >= 0 and best_overlap > 0.3:
+                        # 信頼度 0.3 超のキーポイントをプロンプトに
+                        kps = kps_xy[best_idx]          # (17,2)
+                        conf = kps_conf[best_idx] if kps_conf is not None \
+                               else np.ones(len(kps))
+                        valid = [(float(kp[0]), float(kp[1]))
+                                 for kp, c in zip(kps, conf)
+                                 if c > 0.3 and kp[0] > 0 and kp[1] > 0]
+                        if valid:
+                            point_coords = valid
+                            point_labels = [1] * len(valid)
+                            print(f"[YOLO] {len(valid)} keypoints for SAM2")
+                        bx1_, by1_, bx2_, by2_ = boxes[best_idx]
+                        box_prompt = [float(bx1_), float(by1_),
+                                      float(bx2_), float(by2_)]
+            # --- SAM2 推論 ---
             with lock:
                 with torch.inference_mode():
-                    sam2_predictor.set_image(np.array(pil_image))
+                    sam2_predictor.set_image(img_arr)
                     masks, scores, _ = sam2_predictor.predict(
-                        point_coords=np.array([[cx, cy]]),
-                        point_labels=np.array([1]),
-                        box=np.array([bx1, by1, bx2, by2]),
+                        point_coords=np.array(point_coords),
+                        point_labels=np.array(point_labels),
+                        box=np.array(box_prompt),
                         multimask_output=True,
                     )
             seg_mask[0] = masks[scores.argmax()]
@@ -419,7 +459,7 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
 
 def open_results_window(root, results: list[dict], query_face_idx: int,
                         face_db=None, query_emb=None,
-                        sam2_predictor=None, sam2_lock=None):
+                        sam2_predictor=None, sam2_lock=None, yolo_model=None):
     win = tk.Toplevel(root)
     win.title(f"Search results for Face #{query_face_idx + 1}  ({len(results)} match(es))")
     win.configure(bg="#1e1e1e")
@@ -481,7 +521,8 @@ def open_results_window(root, results: list[dict], query_face_idx: int,
         def open_full(event, r=rec):
             _open_full_image(root, r["pil_image"], r["face"].bbox, r["path"],
                              face_db=face_db, query_emb=query_emb,
-                             sam2_predictor=sam2_predictor, sam2_lock=sam2_lock)
+                             sam2_predictor=sam2_predictor, sam2_lock=sam2_lock,
+                             yolo_model=yolo_model)
 
         img_label.bind("<Button-1>", open_full)
 
@@ -602,6 +643,19 @@ def main():
             traceback.print_exc()
             init_result["sam2_predictor"] = None
 
+        try:
+            from ultralytics import YOLO
+            print("[Init] Loading YOLOv8 Pose model (CPU)...")
+            yolo = YOLO("yolov8n-pose.pt")
+            yolo.to("cpu")
+            init_result["yolo_model"] = yolo
+            print("[Init] YOLOv8 Pose loaded (CPU)")
+        except Exception as e:
+            import traceback
+            print(f"[Init] YOLOv8 Pose not available: {e}")
+            traceback.print_exc()
+            init_result["yolo_model"] = None
+
         root.after(0, _on_init_done)
 
     threading.Thread(target=_do_init, daemon=True).start()
@@ -623,13 +677,14 @@ def main():
             return
 
         _setup_main(root, image_path, search_dir, init_result["face_app"],
-                    sam2_predictor=init_result["sam2_predictor"])
+                    sam2_predictor=init_result["sam2_predictor"],
+                    yolo_model=init_result.get("yolo_model"))
 
     root.mainloop()
 
 
 def _setup_main(root: tk.Tk, image_path: str | None, search_dir: Path, face_app,
-                sam2_predictor=None):
+                sam2_predictor=None, yolo_model=None):
     face_app_lock = threading.Lock()
     sam2_lock     = threading.Lock() if sam2_predictor is not None else None
     INFO_PANEL_W  = 320
@@ -874,7 +929,8 @@ def _setup_main(root: tk.Tk, image_path: str | None, search_dir: Path, face_app,
     def _show_results(results, face_idx, query_emb):
         status_var.set(f"{len(results)} match(es) found")
         open_results_window(root, results, face_idx, face_db=face_db, query_emb=query_emb,
-                            sam2_predictor=sam2_predictor, sam2_lock=sam2_lock)
+                            sam2_predictor=sam2_predictor, sam2_lock=sam2_lock,
+                            yolo_model=yolo_model)
 
     canvas.bind("<Button-1>", on_click)
 
