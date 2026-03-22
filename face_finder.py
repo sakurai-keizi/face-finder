@@ -268,6 +268,8 @@ class DirectoryFaceDB:
         ).start()
 
     def _scan(self, on_progress, on_complete):
+        import concurrent.futures, os as _os
+
         image_files = sorted(
             p for p in self.directory.rglob("*")
             if p.suffix.lower() in IMAGE_EXTENSIONS
@@ -275,55 +277,65 @@ class DirectoryFaceDB:
         self.total = len(image_files)
         print(f"[Scan] {self.total} image(s) found in '{self.directory}'")
 
-        for i, path in enumerate(image_files):
-            if on_progress:
-                on_progress(i + 1, self.total, path.name)
-            try:
-                img_hash = _hash_file(path)
+        cache_lock   = threading.Lock()   # _cache dict の複合操作を保護
+        counter_lock = threading.Lock()   # 進捗カウンター保護
+        done         = [0]
 
-                if img_hash in self._cache:
-                    # ---- キャッシュヒット ----
-                    cached = self._cache[img_hash]
-                    img = Image.open(path).convert("RGB")
+        def _process_one(path):
+            img_hash = _hash_file(path)
+
+            with cache_lock:
+                cached = self._cache.get(img_hash)
+
+            if cached is not None:
+                img = Image.open(path).convert("RGB")
+                return path, img, cached, True
+
+            # キャッシュミス: InsightFace 推論（lock で逐次実行）
+            img = Image.open(path).convert("RGB")
+            bgr = np.array(img)[:, :, ::-1].copy()
+            with self.face_app_lock:
+                raw_faces = self.face_app.get(bgr)
+
+            new_faces: list[CachedFace] = [
+                CachedFace(
+                    bbox      = f.bbox.copy(),
+                    embedding = f.embedding.copy(),
+                    det_score = float(f.det_score) if f.det_score is not None else 0.0,
+                    gender    = int(f.gender) if f.gender is not None else None,
+                    age       = int(f.age)    if f.age    is not None else None,
+                    kps       = f.kps.copy()  if f.kps    is not None else None,
+                )
+                for f in raw_faces if f.embedding is not None
+            ]
+            with cache_lock:
+                self._cache[img_hash] = new_faces
+                self._cache_dirty = True
+
+            return path, img, new_faces, False
+
+        workers = min(_os.cpu_count() or 4, 8)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_process_one, p): p for p in image_files}
+            for future in concurrent.futures.as_completed(futures):
+                path = futures[future]
+                try:
+                    path, img, faces, from_cache = future.result()
                     with self._lock:
-                        for cf in cached:
-                            self.records.append(
-                                {"path": path, "face": cf, "pil_image": img}
-                            )
-                    print(f"[Scan] ({i + 1}/{self.total}) {path.name}"
-                          f"  -> {len(cached)} face(s)  [cache]")
-                else:
-                    # ---- 新規: InsightFace で検出 ----
-                    img = Image.open(path).convert("RGB")
-                    bgr = np.array(img)[:, :, ::-1].copy()
-                    with self.face_app_lock:
-                        raw_faces = self.face_app.get(bgr)
-
-                    new_faces: list[CachedFace] = []
-                    for f in raw_faces:
-                        if f.embedding is not None:
-                            new_faces.append(CachedFace(
-                                bbox      = f.bbox.copy(),
-                                embedding = f.embedding.copy(),
-                                det_score = float(f.det_score) if f.det_score is not None else 0.0,
-                                gender    = int(f.gender) if f.gender is not None else None,
-                                age       = int(f.age)    if f.age    is not None else None,
-                                kps       = f.kps.copy()  if f.kps    is not None else None,
-                            ))
-
-                    self._cache[img_hash] = new_faces
-                    self._cache_dirty = True
-
-                    with self._lock:
-                        for cf in new_faces:
-                            self.records.append(
-                                {"path": path, "face": cf, "pil_image": img}
-                            )
-                    print(f"[Scan] ({i + 1}/{self.total}) {path.name}"
-                          f"  -> {len(new_faces)} face(s)")
-
-            except Exception as e:
-                print(f"[Scan] ({i + 1}/{self.total}) {path.name}  -> ERROR: {e}")
+                        for cf in faces:
+                            self.records.append({"path": path, "face": cf, "pil_image": img})
+                    tag = "  [cache]" if from_cache else ""
+                    with counter_lock:
+                        done[0] += 1
+                        n = done[0]
+                    print(f"[Scan] ({n}/{self.total}) {path.name}  -> {len(faces)} face(s){tag}")
+                except Exception as e:
+                    with counter_lock:
+                        done[0] += 1
+                        n = done[0]
+                    print(f"[Scan] ({n}/{self.total}) {path.name}  -> ERROR: {e}")
+                if on_progress:
+                    on_progress(done[0], self.total, path.name)
 
         if self._cache_dirty:
             _save_cache(self.cache_path, self._cache)
