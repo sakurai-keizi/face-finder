@@ -7,6 +7,7 @@
 #   "numpy",
 #   "onnxruntime-gpu",
 #   "tkinterdnd2",
+#   "sam2",
 # ]
 # ///
 
@@ -288,7 +289,8 @@ def make_face_thumb(pil_image: Image.Image, bbox, thumb_size=THUMB_SIZE) -> Imag
 
 def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                      face_db: "DirectoryFaceDB | None" = None,
-                     query_emb: "np.ndarray | None" = None):
+                     query_emb: "np.ndarray | None" = None,
+                     sam2_predictor=None, sam2_lock: "threading.Lock | None" = None):
     win = tk.Toplevel(root)
     win.title(str(path))
     win.configure(bg="#1e1e1e")
@@ -311,11 +313,48 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
     canvas = tk.Canvas(win, bg="#1e1e1e", highlightthickness=0)
     canvas.pack(fill=tk.BOTH, expand=True)
 
+    # SAM2 セグメンテーションマスク（バックグラウンドで取得）
+    seg_mask: list[np.ndarray | None] = [None]
+
+    def _run_sam2():
+        if sam2_predictor is None:
+            return
+        import torch
+        x1, y1, x2, y2 = [int(c) for c in matched_bbox]
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        try:
+            lock = sam2_lock if sam2_lock is not None else threading.Lock()
+            with lock:
+                with torch.inference_mode():
+                    sam2_predictor.set_image(np.array(pil_image))
+                    masks, scores, _ = sam2_predictor.predict(
+                        point_coords=np.array([[cx, cy]]),
+                        point_labels=np.array([1]),
+                        multimask_output=True,
+                    )
+            seg_mask[0] = masks[scores.argmax()]
+            print(f"[SAM2] Segmentation done for {path.name}")
+            win.after(0, _redraw)
+        except Exception as e:
+            print(f"[SAM2] Error: {e}")
+
     # BBOXを描画した画像を生成（スケール引数に応じて）
     def _render(scale: float) -> Image.Image:
         disp_w = int(orig_w * scale)
         disp_h = int(orig_h * scale)
         img  = pil_image.resize((disp_w, disp_h), Image.LANCZOS).copy()
+
+        # SAM2 マスクオーバーレイ（シアン半透明）
+        if seg_mask[0] is not None:
+            mask_img = Image.fromarray(
+                (seg_mask[0].astype(np.uint8) * 255)
+            ).resize((disp_w, disp_h), Image.NEAREST)
+            mask_arr = np.array(mask_img) > 128
+            img_arr  = np.array(img).astype(np.float32)
+            teal     = np.array([0, 200, 255], dtype=np.float32)
+            img_arr[mask_arr] = img_arr[mask_arr] * 0.55 + teal * 0.45
+            img = Image.fromarray(np.clip(img_arr, 0, 255).astype(np.uint8))
+
         draw = ImageDraw.Draw(img)
 
         # 点線BBOX: 有り得そうな他の顔
@@ -332,9 +371,10 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                     draw_dashed_rect(draw, [sx1, sy1, sx2, sy2],
                                      color="orange", width=max(2, int(2 * scale)), dash=10)
 
-        # 実線BBOX: マッチした顔
-        x1, y1, x2, y2 = [c * scale for c in matched_bbox]
-        draw.rectangle([x1, y1, x2, y2], outline="yellow", width=max(2, int(3 * scale)))
+        # 実線BBOX: マスク未取得中のみ表示
+        if seg_mask[0] is None:
+            x1, y1, x2, y2 = [c * scale for c in matched_bbox]
+            draw.rectangle([x1, y1, x2, y2], outline="yellow", width=max(2, int(3 * scale)))
         return img
 
     photo_ref   = [None]
@@ -361,6 +401,7 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
         resize_after[0] = win.after(80, _redraw)
 
     canvas.bind("<Configure>", _on_resize)
+    threading.Thread(target=_run_sam2, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +409,8 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
 # ---------------------------------------------------------------------------
 
 def open_results_window(root, results: list[dict], query_face_idx: int,
-                        face_db=None, query_emb=None):
+                        face_db=None, query_emb=None,
+                        sam2_predictor=None, sam2_lock=None):
     win = tk.Toplevel(root)
     win.title(f"Search results for Face #{query_face_idx + 1}  ({len(results)} match(es))")
     win.configure(bg="#1e1e1e")
@@ -429,7 +471,8 @@ def open_results_window(root, results: list[dict], query_face_idx: int,
 
         def open_full(event, r=rec):
             _open_full_image(root, r["pil_image"], r["face"].bbox, r["path"],
-                             face_db=face_db, query_emb=query_emb)
+                             face_db=face_db, query_emb=query_emb,
+                             sam2_predictor=sam2_predictor, sam2_lock=sam2_lock)
 
         img_label.bind("<Button-1>", open_full)
 
@@ -534,6 +577,17 @@ def main():
         ])
         face_app.prepare(ctx_id=0, det_size=(640, 640))
         init_result["face_app"] = face_app
+
+        try:
+            from sam2.sam2_image_predictor import SAM2ImagePredictor
+            print("[Init] Loading SAM2 model...")
+            sam2 = SAM2ImagePredictor.from_pretrained("facebook/sam2.1-hiera-small")
+            init_result["sam2_predictor"] = sam2
+            print("[Init] SAM2 loaded")
+        except Exception as e:
+            print(f"[Init] SAM2 not available: {e}")
+            init_result["sam2_predictor"] = None
+
         root.after(0, _on_init_done)
 
     threading.Thread(target=_do_init, daemon=True).start()
@@ -543,13 +597,16 @@ def main():
         print(f"[Init] Done in {elapsed:.1f}s")
         progress.stop()
         load_frame.destroy()
-        _setup_main(root, image_path, search_dir, init_result["face_app"])
+        _setup_main(root, image_path, search_dir, init_result["face_app"],
+                    sam2_predictor=init_result.get("sam2_predictor"))
 
     root.mainloop()
 
 
-def _setup_main(root: tk.Tk, image_path: str | None, search_dir: Path, face_app):
+def _setup_main(root: tk.Tk, image_path: str | None, search_dir: Path, face_app,
+                sam2_predictor=None):
     face_app_lock = threading.Lock()
+    sam2_lock     = threading.Lock() if sam2_predictor is not None else None
     INFO_PANEL_W  = 320
     PLACEHOLDER_W, PLACEHOLDER_H = 640, 480
 
@@ -791,7 +848,8 @@ def _setup_main(root: tk.Tk, image_path: str | None, search_dir: Path, face_app)
 
     def _show_results(results, face_idx, query_emb):
         status_var.set(f"{len(results)} match(es) found")
-        open_results_window(root, results, face_idx, face_db=face_db, query_emb=query_emb)
+        open_results_window(root, results, face_idx, face_db=face_db, query_emb=query_emb,
+                            sam2_predictor=sam2_predictor, sam2_lock=sam2_lock)
 
     canvas.bind("<Button-1>", on_click)
 
