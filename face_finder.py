@@ -323,7 +323,7 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
 
     # SAM2 セグメンテーションマスク（バックグラウンドで取得）
     seg_mask: list[np.ndarray | None] = [None]
-    current_mode = ["small"]  # "small" | "large"
+    current_mode = ["large"]  # "small" | "large"
 
     def _run_sam2():
         import torch, traceback
@@ -504,7 +504,7 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
 
     canvas.bind("<Configure>", _on_resize)
 
-    mode_label = tk.StringVar(value="高精度モードへ切替")
+    mode_label = tk.StringVar(value="標準モードへ切替")
 
     def _toggle_mode():
         new_mode = "large" if current_mode[0] == "small" else "small"
