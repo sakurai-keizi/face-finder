@@ -15,11 +15,14 @@
 # ///
 
 import sys
-import ctypes
-try:
-    ctypes.cdll.LoadLibrary("libX11.so.6").XInitThreads()
-except Exception:
-    pass
+import os
+
+# CUDA (onnxruntime-gpu / PyTorch) は GPU-ディスプレイ連携のため起動時に X11 へ接続し、
+# Tkinter の X11 セッションと競合して XCB がシーケンス番号不一致で abort する。
+# CUDA_VISIBLE_DEVICES="" でデバイスを隠し、すべて CPU で動作させることで回避する。
+# GPU を使いたい場合は環境変数 FACE_FINDER_GPU=1 を設定して起動すること（動作保証外）。
+if not os.environ.get("FACE_FINDER_GPU"):
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 import time
 import hashlib
@@ -780,12 +783,8 @@ def main():
     # --- GPU スレッドのウォームアップ（Tk / X11 起動前）---
     # onnxruntime-gpu は初回実行スレッドで CUDA コンテキストを作成する際に
     # NVIDIA ドライバ経由で X11 ディスプレイを参照することがある。
-    # Tk が X11 をオープンする前に GPU スレッドでダミー推論を走らせておくことで
-    # CUDA コンテキストを確立し、XCB のシーケンス番号競合クラッシュを回避する。
     gpu_runner = GPUTaskRunner()
-    dummy_bgr = np.zeros((64, 64, 3), dtype=np.uint8)
-    gpu_runner.run(face_app.get, dummy_bgr)
-    print(f"[Init] Done in {time.time() - start_time:.1f}s  (GPU thread warmed up)")
+    print(f"[Init] Done in {time.time() - start_time:.1f}s")
 
     sam2_ctx = SAM2Context(
         predictor=sam2_predictor,
