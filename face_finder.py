@@ -294,7 +294,7 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                      face_db: "DirectoryFaceDB | None" = None,
                      query_emb: "np.ndarray | None" = None,
                      sam2_predictor=None, sam2_lock: "threading.Lock | None" = None,
-                     yolo_model=None):
+                     yolo_model=None, sam2_extra: "dict | None" = None):
     win = tk.Toplevel(root)
     win.title(str(path))
     win.configure(bg="#1e1e1e")
@@ -314,16 +314,42 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
         win.geometry(f"{init_w}x{init_h}")
     win.after(100, _set_geometry)
 
+    toolbar = tk.Frame(win, bg="#2a2a2a", height=32)
+    toolbar.pack(side=tk.BOTTOM, fill=tk.X)
+    toolbar.pack_propagate(False)
+
     canvas = tk.Canvas(win, bg="#1e1e1e", highlightthickness=0)
     canvas.pack(fill=tk.BOTH, expand=True)
 
     # SAM2 セグメンテーションマスク（バックグラウンドで取得）
     seg_mask: list[np.ndarray | None] = [None]
+    current_mode = ["small"]  # "small" | "large"
 
     def _run_sam2():
-        if sam2_predictor is None:
-            return
         import torch, traceback
+        # モードに応じてモデルを選択（large は遅延ロード）
+        if current_mode[0] == "large":
+            lock = sam2_lock if sam2_lock is not None else threading.Lock()
+            predictor = (sam2_extra or {}).get("large")
+            if predictor is None:
+                try:
+                    from sam2.sam2_image_predictor import SAM2ImagePredictor
+                    print("[SAM2] Loading hiera-large (first use, please wait)...")
+                    with lock:
+                        predictor = SAM2ImagePredictor.from_pretrained(
+                            "facebook/sam2.1-hiera-large", device="cpu"
+                        )
+                    if sam2_extra is not None:
+                        sam2_extra["large"] = predictor
+                    print("[SAM2] hiera-large loaded")
+                except Exception as e:
+                    print(f"[SAM2] Large model load failed: {e}")
+                    traceback.print_exc()
+                    return
+        else:
+            predictor = sam2_predictor
+        if predictor is None:
+            return
         x1, y1, x2, y2 = [int(c) for c in matched_bbox]
         cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
         img_arr = np.array(pil_image)
@@ -374,7 +400,7 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
             # --- SAM2 推論 ---
             with lock:
                 with torch.inference_mode():
-                    sam2_predictor.set_image(img_arr)
+                    predictor.set_image(img_arr)
                     masks, scores, _ = sam2_predictor.predict(
                         point_coords=np.array(point_coords),
                         point_labels=np.array(point_labels),
@@ -452,6 +478,23 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
         resize_after[0] = win.after(80, _redraw)
 
     canvas.bind("<Configure>", _on_resize)
+
+    mode_label = tk.StringVar(value="高精度モードへ切替")
+
+    def _toggle_mode():
+        new_mode = "large" if current_mode[0] == "small" else "small"
+        current_mode[0] = new_mode
+        mode_label.set("標準モードへ切替" if new_mode == "large" else "高精度モードへ切替")
+        seg_mask[0] = None
+        _redraw()
+        threading.Thread(target=_run_sam2, daemon=True).start()
+
+    tk.Button(
+        toolbar, textvariable=mode_label,
+        bg="#444", fg="white", relief=tk.FLAT, padx=10,
+        command=_toggle_mode,
+    ).pack(side=tk.RIGHT, padx=6, pady=4)
+
     threading.Thread(target=_run_sam2, daemon=True).start()
 
 
@@ -461,7 +504,8 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
 
 def open_results_window(root, results: list[dict], query_face_idx: int,
                         face_db=None, query_emb=None,
-                        sam2_predictor=None, sam2_lock=None, yolo_model=None):
+                        sam2_predictor=None, sam2_lock=None, yolo_model=None,
+                        sam2_extra=None):
     win = tk.Toplevel(root)
     win.title(f"Search results for Face #{query_face_idx + 1}  ({len(results)} match(es))")
     win.configure(bg="#1e1e1e")
@@ -524,7 +568,7 @@ def open_results_window(root, results: list[dict], query_face_idx: int,
             _open_full_image(root, r["pil_image"], r["face"].bbox, r["path"],
                              face_db=face_db, query_emb=query_emb,
                              sam2_predictor=sam2_predictor, sam2_lock=sam2_lock,
-                             yolo_model=yolo_model)
+                             yolo_model=yolo_model, sam2_extra=sam2_extra)
 
         img_label.bind("<Button-1>", open_full)
 
@@ -689,6 +733,7 @@ def _setup_main(root: tk.Tk, image_path: str | None, search_dir: Path, face_app,
                 sam2_predictor=None, yolo_model=None):
     face_app_lock = threading.Lock()
     sam2_lock     = threading.Lock() if sam2_predictor is not None else None
+    sam2_extra    = {"large": None}  # 高精度モデルの遅延ロード用
     INFO_PANEL_W  = 320
     PLACEHOLDER_W, PLACEHOLDER_H = 640, 480
 
@@ -932,7 +977,7 @@ def _setup_main(root: tk.Tk, image_path: str | None, search_dir: Path, face_app,
         status_var.set(f"{len(results)} match(es) found")
         open_results_window(root, results, face_idx, face_db=face_db, query_emb=query_emb,
                             sam2_predictor=sam2_predictor, sam2_lock=sam2_lock,
-                            yolo_model=yolo_model)
+                            yolo_model=yolo_model, sam2_extra=sam2_extra)
 
     canvas.bind("<Button-1>", on_click)
 
