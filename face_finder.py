@@ -728,32 +728,33 @@ def main():
         print(f"Error: '{image_path}' is not a file")
         sys.exit(1)
 
-    trt_cache_dir = Path.home() / ".cache" / "face_finder" / "trt"
-    trt_cache_dir.mkdir(parents=True, exist_ok=True)
-
-    trt_available   = "TensorrtExecutionProvider" in onnxruntime.get_available_providers()
-    trt_needs_build = trt_available and not any(trt_cache_dir.glob("*.engine"))
-
-    # --- モデルを GUI 起動前にメインスレッドで読み込む ---
-    # （バックグラウンドスレッドで onnxruntime-gpu / PyTorch を初期化すると
-    #   X11 の XInitThreads 競合で XCB が abort するため）
-    if trt_needs_build:
-        print("[Init] TensorRT engine build required (first run). This may take several minutes.")
-    elif trt_available:
-        print("[Init] Loading TensorRT engine from cache.")
-    else:
-        print("[Init] Loading InsightFace model.")
-
     start_time = time.time()
 
-    face_app = FaceAnalysis(providers=[
-        ("TensorrtExecutionProvider", {
-            "trt_engine_cache_enable": True,
-            "trt_engine_cache_path":   str(trt_cache_dir),
-        }),
-        "CUDAExecutionProvider",
-        "CPUExecutionProvider",
-    ])
+    gpu_enabled = bool(os.environ.get("FACE_FINDER_GPU"))
+    if gpu_enabled:
+        trt_cache_dir = Path.home() / ".cache" / "face_finder" / "trt"
+        trt_cache_dir.mkdir(parents=True, exist_ok=True)
+        trt_available   = "TensorrtExecutionProvider" in onnxruntime.get_available_providers()
+        trt_needs_build = trt_available and not any(trt_cache_dir.glob("*.engine"))
+        if trt_needs_build:
+            print("[Init] TensorRT engine build required (first run). This may take several minutes.")
+        elif trt_available:
+            print("[Init] Loading TensorRT engine from cache.")
+        else:
+            print("[Init] Loading InsightFace model (GPU).")
+        providers = [
+            ("TensorrtExecutionProvider", {
+                "trt_engine_cache_enable": True,
+                "trt_engine_cache_path":   str(trt_cache_dir),
+            }),
+            "CUDAExecutionProvider",
+            "CPUExecutionProvider",
+        ]
+    else:
+        print("[Init] Loading InsightFace model (CPU).")
+        providers = ["CPUExecutionProvider"]
+
+    face_app = FaceAnalysis(providers=providers)
     face_app.prepare(ctx_id=0, det_size=(640, 640))
 
     try:
