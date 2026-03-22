@@ -606,7 +606,7 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
         # 全身 BBOX（YOLO 検出結果）
         if body_bbox[0] is not None:
             bx1, by1, bx2, by2 = [c * scale for c in body_bbox[0]]
-            draw.rectangle([bx1, by1, bx2, by2], outline="#00ccff", width=max(2, int(2 * scale)))
+            draw.rectangle([bx1, by1, bx2, by2], outline="yellow", width=max(2, int(2 * scale)))
 
         # 点線BBOX: 有り得そうな他の顔
         if face_db is not None and query_emb is not None:
