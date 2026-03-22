@@ -71,14 +71,14 @@ uv run face_finder.py ./photos/ ./photos/group_photo.jpg
 [Scan] (2/8) img002.jpg  -> 3 face(s)
 ...
 [Scan] Done. Total faces indexed: 218
-[Cache] Saved to photos/.face_finder_cache.pkl
+[Cache] Saved to ./.face_finder_cache.pkl
 ```
 
 画像ファイルを省略した場合は「画像をここにドロップしてください」のプレースホルダーが表示されます。スキャンはその間も進行します。
 
 #### キャッシュ
 
-スキャン済み画像の顔座標・特徴ベクトルは検索ディレクトリ内の `.face_finder_cache.pkl` に保存されます。次回起動時は画像バイナリの SHA-256 ハッシュで同一性を確認し、一致した場合は InsightFace の推論をスキップします。画像が変更された場合はハッシュが変わるため自動的に再検出されます。
+スキャン済み画像の顔座標・特徴ベクトルはカレントディレクトリの `.face_finder_cache.pkl` に保存されます。次回起動時は画像バイナリの SHA-256 ハッシュで同一性を確認し、一致した場合は InsightFace の推論をスキップします。画像が変更された場合はハッシュが変わるため自動的に再検出されます。
 
 ### 結果ウィンドウ
 
