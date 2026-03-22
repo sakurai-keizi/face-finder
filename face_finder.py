@@ -198,6 +198,15 @@ class CachedFace:
     kps:       np.ndarray | None = None
 
 
+@dataclass
+class SAM2Context:
+    """SAM2・YOLO 関連のモデルと同期オブジェクトをまとめるコンテナ。"""
+    predictor: object                        # SAM2ImagePredictor (hiera-small)
+    lock:      threading.Lock                # SAM2 / YOLO 推論の排他ロック
+    yolo:      object                        # YOLOv8 Pose モデル (None 可)
+    extra:     dict = field(default_factory=dict)  # {"large": predictor} 遅延ロード用
+
+
 # ---------------------------------------------------------------------------
 # キャッシュ I/O
 # ---------------------------------------------------------------------------
@@ -427,8 +436,7 @@ def make_face_thumb(pil_image: Image.Image, bbox, thumb_size=THUMB_SIZE) -> Imag
 def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                      face_db: "DirectoryFaceDB | None" = None,
                      query_emb: "np.ndarray | None" = None,
-                     sam2_predictor=None, sam2_lock: "threading.Lock | None" = None,
-                     yolo_model=None, sam2_extra: "dict | None" = None):
+                     sam2_ctx: "SAM2Context | None" = None):
     win = tk.Toplevel(root)
     win.title(str(path))
     win.configure(bg="#1e1e1e")
@@ -461,35 +469,33 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
 
     def _run_sam2():
         import torch, traceback
+        if sam2_ctx is None:
+            return
         # モードに応じてモデルを選択（large は遅延ロード）
         if current_mode[0] == "large":
-            lock = sam2_lock if sam2_lock is not None else threading.Lock()
-            predictor = (sam2_extra or {}).get("large")
+            predictor = sam2_ctx.extra.get("large")
             if predictor is None:
                 try:
                     from sam2.sam2_image_predictor import SAM2ImagePredictor
                     print("[SAM2] Loading hiera-large (first use, please wait)...")
-                    with lock:
+                    with sam2_ctx.lock:
                         predictor = SAM2ImagePredictor.from_pretrained(
                             "facebook/sam2.1-hiera-large", device="cpu"
                         )
-                    if sam2_extra is not None:
-                        sam2_extra["large"] = predictor
+                    sam2_ctx.extra["large"] = predictor
                     print("[SAM2] hiera-large loaded")
                 except Exception as e:
                     print(f"[SAM2] Large model load failed: {e}")
                     traceback.print_exc()
                     return
         else:
-            predictor = sam2_predictor
+            predictor = sam2_ctx.predictor
         if predictor is None:
             return
         x1, y1, x2, y2 = [int(c) for c in matched_bbox]
         cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
         img_arr = np.array(pil_image)
         try:
-            lock = sam2_lock if sam2_lock is not None else threading.Lock()
-
             # --- YOLOv8 Pose でキーポイントと人物 BBOX を取得 ---
             point_coords = [[cx, cy]]
             point_labels = [1]
@@ -501,9 +507,9 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                          min(pil_image.height, y2 + int(fh * 6))]
             crop_offset = (0, 0)
 
-            if yolo_model is not None:
-                with lock:
-                    yolo_res = yolo_model(img_arr, verbose=False)
+            if sam2_ctx.yolo is not None:
+                with sam2_ctx.lock:
+                    yolo_res = sam2_ctx.yolo(img_arr, verbose=False)
                 if yolo_res and yolo_res[0].keypoints is not None:
                     boxes    = yolo_res[0].boxes.xyxy.cpu().numpy()
                     kps_xy   = yolo_res[0].keypoints.xy.cpu().numpy()
@@ -547,7 +553,7 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                         print(f"[YOLO] {len(valid)} kps, crop={sam2_img.shape[:2]}")
 
             # --- SAM2 推論 ---
-            with lock:
+            with sam2_ctx.lock:
                 with torch.inference_mode():
                     predictor.set_image(sam2_img)
                     masks, scores, _ = predictor.predict(
@@ -721,8 +727,7 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
 
 def open_results_window(root, results: list[dict], query_face_idx: int,
                         face_db=None, query_emb=None,
-                        sam2_predictor=None, sam2_lock=None, yolo_model=None,
-                        sam2_extra=None):
+                        sam2_ctx: "SAM2Context | None" = None):
     win = tk.Toplevel(root)
     win.title(f"Search results for Face #{query_face_idx + 1}  ({len(results)} match(es))")
     win.configure(bg="#1e1e1e")
@@ -784,8 +789,7 @@ def open_results_window(root, results: list[dict], query_face_idx: int,
         def open_full(event, r=rec):
             _open_full_image(root, r["pil_image"], r["face"].bbox, r["path"],
                              face_db=face_db, query_emb=query_emb,
-                             sam2_predictor=sam2_predictor, sam2_lock=sam2_lock,
-                             yolo_model=yolo_model, sam2_extra=sam2_extra)
+                             sam2_ctx=sam2_ctx)
 
         img_label.bind("<Button-1>", open_full)
 
@@ -929,7 +933,8 @@ def main():
         progress.stop()
         load_frame.destroy()
 
-        if init_result.get("sam2_predictor") is None:
+        sam2_predictor = init_result.get("sam2_predictor")
+        if sam2_predictor is None:
             from tkinter import messagebox
             messagebox.showerror(
                 "初期化エラー",
@@ -939,18 +944,20 @@ def main():
             root.destroy()
             return
 
+        sam2_ctx = SAM2Context(
+            predictor=sam2_predictor,
+            lock=threading.Lock(),
+            yolo=init_result.get("yolo_model"),
+        )
         _setup_main(root, image_path, search_dir, init_result["face_app"],
-                    sam2_predictor=init_result["sam2_predictor"],
-                    yolo_model=init_result.get("yolo_model"))
+                    sam2_ctx=sam2_ctx)
 
     root.mainloop()
 
 
 def _setup_main(root: tk.Tk, image_path: str | None, search_dir: Path, face_app,
-                sam2_predictor=None, yolo_model=None):
+                sam2_ctx: "SAM2Context | None" = None):
     face_app_lock = threading.Lock()
-    sam2_lock     = threading.Lock() if sam2_predictor is not None else None
-    sam2_extra    = {"large": None}  # 高精度モデルの遅延ロード用
     INFO_PANEL_W  = 320
     PLACEHOLDER_W, PLACEHOLDER_H = 640, 480
 
@@ -1201,8 +1208,7 @@ def _setup_main(root: tk.Tk, image_path: str | None, search_dir: Path, face_app,
     def _show_results(results, face_idx, query_emb):
         status_var.set(f"{len(results)} match(es) found")
         open_results_window(root, results, face_idx, face_db=face_db, query_emb=query_emb,
-                            sam2_predictor=sam2_predictor, sam2_lock=sam2_lock,
-                            yolo_model=yolo_model, sam2_extra=sam2_extra)
+                            sam2_ctx=sam2_ctx)
 
     canvas.bind("<Button-1>", on_click)
 
