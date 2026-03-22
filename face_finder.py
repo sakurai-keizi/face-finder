@@ -510,9 +510,14 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                     kps_conf = yolo_res[0].keypoints.conf
                     if kps_conf is not None:
                         kps_conf = kps_conf.cpu().numpy()
-                    # 顔キーポイント（鼻・目）と InsightFace 顔中心の距離で同一人物を判定
+                    # 同一人物の判定: 3段階フォールバック
                     # COCO: 0=鼻, 1=左目, 2=右目, 3=左耳, 4=右耳
                     FACE_KPS = [0, 1, 2, 3, 4]
+                    # InsightFace 顔 BBOX を少し拡張（検出誤差吸収）
+                    pad = max(fw, fh) * 0.15
+                    fx1, fy1, fx2, fy2 = x1 - pad, y1 - pad, x2 + pad, y2 + pad
+
+                    # 段階1: 顔キーポイントが InsightFace 顔 BBOX 内に入っている人
                     best_idx, best_kp_dist = -1, float('inf')
                     for i in range(len(boxes)):
                         kps  = kps_xy[i]
@@ -520,11 +525,29 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                         for ki in FACE_KPS:
                             if ki < len(kps) and conf[ki] > 0.3 \
                                     and kps[ki][0] > 0 and kps[ki][1] > 0:
-                                dist = float(np.hypot(kps[ki][0] - cx, kps[ki][1] - cy))
-                                if dist < best_kp_dist:
-                                    best_kp_dist, best_idx = dist, i
-                                break  # 最も信頼度の高い顔 kp を使ったら次の人へ
-                    # フォールバック: 顔 kp が全員未検出なら最大オーバーラップ
+                                kx, ky = kps[ki][0], kps[ki][1]
+                                if fx1 <= kx <= fx2 and fy1 <= ky <= fy2:
+                                    dist = float(np.hypot(kx - cx, ky - cy))
+                                    if dist < best_kp_dist:
+                                        best_kp_dist, best_idx = dist, i
+                                break  # 各人物の最初の有効 kp だけ使う
+
+                    # 段階2: BBOX 内に入る kp なし → 距離最小
+                    if best_idx == -1:
+                        for i in range(len(boxes)):
+                            kps  = kps_xy[i]
+                            conf = kps_conf[i] if kps_conf is not None \
+                                   else np.ones(len(kps))
+                            for ki in FACE_KPS:
+                                if ki < len(kps) and conf[ki] > 0.3 \
+                                        and kps[ki][0] > 0 and kps[ki][1] > 0:
+                                    dist = float(np.hypot(kps[ki][0] - cx,
+                                                          kps[ki][1] - cy))
+                                    if dist < best_kp_dist:
+                                        best_kp_dist, best_idx = dist, i
+                                    break
+
+                    # 段階3: 顔 kp が全員未検出 → 最大オーバーラップ
                     if best_idx == -1:
                         best_overlap = 0.0
                         for i, (bx1_, by1_, bx2_, by2_) in enumerate(boxes):
