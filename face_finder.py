@@ -510,15 +510,21 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                     kps_conf = yolo_res[0].keypoints.conf
                     if kps_conf is not None:
                         kps_conf = kps_conf.cpu().numpy()
-                    # 顔中心点を含む BBOX の中で水平中心が最も近いものを選ぶ
-                    # （密集時に隣人を誤選択しないよう、最初のヒットではなく最近傍を使う）
-                    best_idx, best_hdist = -1, float('inf')
-                    for i, (bx1_, by1_, bx2_, by2_) in enumerate(boxes):
-                        if bx1_ <= cx <= bx2_ and by1_ <= cy <= by2_:
-                            hdist = abs((bx1_ + bx2_) / 2.0 - cx)
-                            if hdist < best_hdist:
-                                best_hdist, best_idx = hdist, i
-                    # フォールバック: 顔中心を含む BBOX がなければ最大オーバーラップ
+                    # 顔キーポイント（鼻・目）と InsightFace 顔中心の距離で同一人物を判定
+                    # COCO: 0=鼻, 1=左目, 2=右目, 3=左耳, 4=右耳
+                    FACE_KPS = [0, 1, 2, 3, 4]
+                    best_idx, best_kp_dist = -1, float('inf')
+                    for i in range(len(boxes)):
+                        kps  = kps_xy[i]
+                        conf = kps_conf[i] if kps_conf is not None else np.ones(len(kps))
+                        for ki in FACE_KPS:
+                            if ki < len(kps) and conf[ki] > 0.3 \
+                                    and kps[ki][0] > 0 and kps[ki][1] > 0:
+                                dist = float(np.hypot(kps[ki][0] - cx, kps[ki][1] - cy))
+                                if dist < best_kp_dist:
+                                    best_kp_dist, best_idx = dist, i
+                                break  # 最も信頼度の高い顔 kp を使ったら次の人へ
+                    # フォールバック: 顔 kp が全員未検出なら最大オーバーラップ
                     if best_idx == -1:
                         best_overlap = 0.0
                         for i, (bx1_, by1_, bx2_, by2_) in enumerate(boxes):
