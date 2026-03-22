@@ -102,7 +102,7 @@ class DirectoryFaceDB:
         self.directory     = directory
         self.face_app      = face_app
         self.face_app_lock = face_app_lock
-        self.cache_path    = directory / CACHE_FILENAME
+        self.cache_path    = Path.cwd() / CACHE_FILENAME
         self._cache        = _load_cache(self.cache_path)
         self._cache_dirty  = False
         self.records: list[dict] = []   # {path, face (CachedFace), pil_image}
