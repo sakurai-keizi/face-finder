@@ -8,6 +8,7 @@
 #   "onnxruntime-gpu",
 #   "tkinterdnd2",
 #   "sam2",
+#   "huggingface_hub",
 # ]
 # ///
 
