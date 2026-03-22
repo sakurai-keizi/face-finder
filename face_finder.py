@@ -510,18 +510,26 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                     kps_conf = yolo_res[0].keypoints.conf
                     if kps_conf is not None:
                         kps_conf = kps_conf.cpu().numpy()
-                    # 顔中心点を含む人物 BBOX を優先、なければ最大オーバーラップ
-                    best_idx, best_overlap = -1, 0.0
+                    # 顔中心点を含む BBOX の中で水平中心が最も近いものを選ぶ
+                    # （密集時に隣人を誤選択しないよう、最初のヒットではなく最近傍を使う）
+                    best_idx, best_hdist = -1, float('inf')
                     for i, (bx1_, by1_, bx2_, by2_) in enumerate(boxes):
                         if bx1_ <= cx <= bx2_ and by1_ <= cy <= by2_:
-                            best_idx, best_overlap = i, 1.0
-                            break
-                        ix = max(0, min(x2, bx2_) - max(x1, bx1_))
-                        iy = max(0, min(y2, by2_) - max(y1, by1_))
-                        ov = ix * iy / max((x2-x1)*(y2-y1), 1)
-                        if ov > best_overlap:
-                            best_overlap, best_idx = ov, i
-                    if best_idx >= 0 and best_overlap > 0.1:
+                            hdist = abs((bx1_ + bx2_) / 2.0 - cx)
+                            if hdist < best_hdist:
+                                best_hdist, best_idx = hdist, i
+                    # フォールバック: 顔中心を含む BBOX がなければ最大オーバーラップ
+                    if best_idx == -1:
+                        best_overlap = 0.0
+                        for i, (bx1_, by1_, bx2_, by2_) in enumerate(boxes):
+                            ix = max(0, min(x2, bx2_) - max(x1, bx1_))
+                            iy = max(0, min(y2, by2_) - max(y1, by1_))
+                            ov = ix * iy / max((x2-x1)*(y2-y1), 1)
+                            if ov > best_overlap:
+                                best_overlap, best_idx = ov, i
+                        if best_overlap <= 0.1:
+                            best_idx = -1
+                    if best_idx >= 0:
                         bx1_, by1_, bx2_, by2_ = boxes[best_idx]
                         body_bbox[0] = [bx1_, by1_, bx2_, by2_]
                         win.after(0, _redraw)
