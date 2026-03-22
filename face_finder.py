@@ -319,7 +319,7 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
     def _run_sam2():
         if sam2_predictor is None:
             return
-        import torch
+        import torch, traceback
         x1, y1, x2, y2 = [int(c) for c in matched_bbox]
         cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
         try:
@@ -337,6 +337,7 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
             win.after(0, _redraw)
         except Exception as e:
             print(f"[SAM2] Error: {e}")
+            traceback.print_exc()
 
     # BBOXを描画した画像を生成（スケール引数に応じて）
     def _render(scale: float) -> Image.Image:
@@ -580,12 +581,17 @@ def main():
 
         try:
             from sam2.sam2_image_predictor import SAM2ImagePredictor
-            print("[Init] Loading SAM2 model...")
-            sam2 = SAM2ImagePredictor.from_pretrained("facebook/sam2.1-hiera-small")
+            # onnxruntime-gpu と PyTorch の CUDA コンテキスト競合を避けるため CPU で動作
+            print("[Init] Loading SAM2 model (CPU)...")
+            sam2 = SAM2ImagePredictor.from_pretrained(
+                "facebook/sam2.1-hiera-small", device="cpu"
+            )
             init_result["sam2_predictor"] = sam2
-            print("[Init] SAM2 loaded")
+            print("[Init] SAM2 loaded (CPU)")
         except Exception as e:
+            import traceback
             print(f"[Init] SAM2 not available: {e}")
+            traceback.print_exc()
             init_result["sam2_predictor"] = None
 
         root.after(0, _on_init_done)
