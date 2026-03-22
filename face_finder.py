@@ -356,8 +356,8 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                         if overlap > best_overlap:
                             best_overlap, best_idx = overlap, i
                     if best_idx >= 0 and best_overlap > 0.3:
-                        # 信頼度 0.3 超のキーポイントをプロンプトに
-                        kps = kps_xy[best_idx]          # (17,2)
+                        # 対象人物: 信頼度 0.3 超のキーポイントを前景点に
+                        kps = kps_xy[best_idx]
                         conf = kps_conf[best_idx] if kps_conf is not None \
                                else np.ones(len(kps))
                         valid = [(float(kp[0]), float(kp[1]))
@@ -366,10 +366,23 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                         if valid:
                             point_coords = valid
                             point_labels = [1] * len(valid)
-                            print(f"[YOLO] {len(valid)} keypoints for SAM2")
                         bx1_, by1_, bx2_, by2_ = boxes[best_idx]
                         box_prompt = [float(bx1_), float(by1_),
                                       float(bx2_), float(by2_)]
+                        # 他の人物: キーポイントを背景点に追加
+                        bg_count = 0
+                        for i in range(len(boxes)):
+                            if i == best_idx:
+                                continue
+                            other_conf = kps_conf[i] if kps_conf is not None \
+                                         else np.ones(len(kps_xy[i]))
+                            bg_kps = [(float(kp[0]), float(kp[1]))
+                                      for kp, c in zip(kps_xy[i], other_conf)
+                                      if c > 0.3 and kp[0] > 0 and kp[1] > 0]
+                            point_coords.extend(bg_kps)
+                            point_labels.extend([0] * len(bg_kps))
+                            bg_count += len(bg_kps)
+                        print(f"[YOLO] {len(valid)} fg + {bg_count} bg keypoints")
             # --- SAM2 推論 ---
             with lock:
                 with torch.inference_mode():
