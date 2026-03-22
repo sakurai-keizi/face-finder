@@ -1038,7 +1038,7 @@ def _setup_main(root: tk.Tk, image_path: str | None, search_dir: Path, face_app,
             x1, y1, x2, y2 = [c * scale for c in face.bbox]
             bw, bh = x2 - x1, y2 - y1
             box_items.append(canvas.create_rectangle(
-                x1 - bw * 0.05, y1 - bh * 0.05, x2 + bw * 0.05, y2 + bh * 0.05,
+                x1 - bw * 0.25, y1 - bh * 0.25, x2 + bw * 0.25, y2 + bh * 0.25,
                 outline="lime", width=2))
     else:
         _draw_placeholder()
@@ -1112,7 +1112,7 @@ def _setup_main(root: tk.Tk, image_path: str | None, search_dir: Path, face_app,
             x1, y1, x2, y2 = [c * scale for c in face.bbox]
             bw, bh = x2 - x1, y2 - y1
             box_items.append(canvas.create_rectangle(
-                x1 - bw * 0.05, y1 - bh * 0.05, x2 + bw * 0.05, y2 + bh * 0.05,
+                x1 - bw * 0.25, y1 - bh * 0.25, x2 + bw * 0.25, y2 + bh * 0.25,
                 outline="lime", width=2))
 
         header_var.set(f"{len(faces)} face(s) detected\nClick to inspect / search")
