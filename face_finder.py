@@ -563,20 +563,11 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
         seg_path = result_dir / f"{stem}_seg_{i:03d}.png"
         seg_img.save(seg_path)
 
-        # BBOX結果: 顔周辺を余白付きでクロップして黄色BBOX描画
-        bx1, by1, bx2, by2 = [int(c) for c in matched_bbox]
-        bw, bh = bx2 - bx1, by2 - by1
-        pad = max(int(max(bw, bh) * 0.4), 20)
-        W, H  = pil_image.size
-        cx1, cy1 = max(0, bx1 - pad), max(0, by1 - pad)
-        cx2, cy2 = min(W, bx2 + pad), min(H, by2 + pad)
-        bbox_crop = pil_image.crop((cx1, cy1, cx2, cy2)).copy()
-        ImageDraw.Draw(bbox_crop).rectangle(
-            [bx1 - cx1, by1 - cy1, bx2 - cx1, by2 - cy1],
-            outline="yellow", width=3,
-        )
+        # BBOX結果: 膨張マスクの外接矩形で元画像をクロップ（アルファなし）
         bbox_path = result_dir / f"{stem}_bbox_{i:03d}.png"
-        bbox_crop.save(bbox_path)
+        pil_image.crop(
+            (cols[0], rows[0], cols[-1] + 1, rows[-1] + 1)
+        ).save(bbox_path)
 
         print(f"[Save] {seg_path.name}, {bbox_path.name}")
         save_status.set(f"保存: {seg_path.name} / {bbox_path.name}")
