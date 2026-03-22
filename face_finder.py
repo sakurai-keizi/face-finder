@@ -24,6 +24,7 @@ except Exception:
 import time
 import hashlib
 import pickle
+import queue
 import threading
 import traceback
 from dataclasses import dataclass, field
@@ -56,6 +57,41 @@ THUMB_SIZE           = 220
 RESULT_COLS          = 4
 CACHE_FILENAME       = ".face_finder_cache.pkl"
 CACHE_VERSION        = 1
+
+
+class GPUTaskRunner:
+    """Routes all onnxruntime/GPU inference through a single dedicated thread.
+
+    On Linux, onnxruntime-gpu creates a new CUDA context the first time it runs
+    in a thread. That context creation may query the X11 display via the NVIDIA
+    driver. If it happens in a background thread after Tkinter has opened the X11
+    connection, XCB detects a sequence-number race and aborts.
+
+    By funnelling every face_app.get() call through this one thread—and running a
+    warm-up inference *before* TkinterDnD.Tk() opens X11—the CUDA context is
+    fully established before X11 is touched, eliminating the race.
+    """
+
+    def __init__(self):
+        self._q = queue.SimpleQueue()
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def _worker(self):
+        while True:
+            fn, args, result_q = self._q.get()
+            try:
+                result_q.put(("ok", fn(*args)))
+            except Exception as e:
+                result_q.put(("err", e))
+
+    def run(self, fn, *args):
+        result_q = queue.SimpleQueue()
+        self._q.put((fn, args, result_q))
+        status, value = result_q.get()
+        if status == "err":
+            raise value
+        return value
 
 
 def _normalize_emb(emb: np.ndarray) -> np.ndarray:
@@ -126,10 +162,10 @@ def _hash_file(path: Path) -> str:
 # ---------------------------------------------------------------------------
 
 class DirectoryFaceDB:
-    def __init__(self, directory: Path, face_app, face_app_lock: threading.Lock):
+    def __init__(self, directory: Path, face_app, gpu_runner: GPUTaskRunner):
         self.directory     = directory
         self.face_app      = face_app
-        self.face_app_lock = face_app_lock
+        self.gpu_runner    = gpu_runner
         self.cache_path    = Path.cwd() / CACHE_FILENAME
         self._cache        = _load_cache(self.cache_path)
         self._cache_dirty  = False
@@ -177,8 +213,7 @@ class DirectoryFaceDB:
                     # ---- 新規: InsightFace で検出 ----
                     img = Image.open(path).convert("RGB")
                     bgr = _pil_to_bgr(img)
-                    with self.face_app_lock:
-                        raw_faces = self.face_app.get(bgr)
+                    raw_faces = self.gpu_runner.run(self.face_app.get, bgr)
 
                     new_faces: list[CachedFace] = []
                     for f in raw_faces:
@@ -742,7 +777,15 @@ def main():
         traceback.print_exc()
         yolo_model = None
 
-    print(f"[Init] Done in {time.time() - start_time:.1f}s")
+    # --- GPU スレッドのウォームアップ（Tk / X11 起動前）---
+    # onnxruntime-gpu は初回実行スレッドで CUDA コンテキストを作成する際に
+    # NVIDIA ドライバ経由で X11 ディスプレイを参照することがある。
+    # Tk が X11 をオープンする前に GPU スレッドでダミー推論を走らせておくことで
+    # CUDA コンテキストを確立し、XCB のシーケンス番号競合クラッシュを回避する。
+    gpu_runner = GPUTaskRunner()
+    dummy_bgr = np.zeros((64, 64, 3), dtype=np.uint8)
+    gpu_runner.run(face_app.get, dummy_bgr)
+    print(f"[Init] Done in {time.time() - start_time:.1f}s  (GPU thread warmed up)")
 
     sam2_ctx = SAM2Context(
         predictor=sam2_predictor,
@@ -756,18 +799,19 @@ def main():
     root.title("Face Finder")
     root.configure(bg="#1e1e1e")
 
-    _setup_main(root, image_path, search_dir, face_app, sam2_ctx=sam2_ctx)
+    _setup_main(root, image_path, search_dir, face_app,
+                gpu_runner=gpu_runner, sam2_ctx=sam2_ctx)
     root.mainloop()
 
 
 def _setup_main(root: tk.Tk, image_path: str | None, search_dir: Path, face_app,
+                gpu_runner: "GPUTaskRunner | None" = None,
                 sam2_ctx: "SAM2Context | None" = None):
-    face_app_lock = threading.Lock()
     INFO_PANEL_W  = 320
     PLACEHOLDER_W, PLACEHOLDER_H = 640, 480
 
     # スキャンを即時開始（search_dir は必須）
-    face_db = DirectoryFaceDB(search_dir, face_app, face_app_lock)
+    face_db = DirectoryFaceDB(search_dir, face_app, gpu_runner)
     face_db.start_scan()
 
     # 現在表示中の画像ファイルパス（None = プレースホルダー表示中）
@@ -778,8 +822,7 @@ def _setup_main(root: tk.Tk, image_path: str | None, search_dir: Path, face_app,
         print("Detecting faces in main image...")
         pil_image = Image.open(image_path).convert("RGB")
         bgr_image = _pil_to_bgr(pil_image)
-        with face_app_lock:
-            faces = face_app.get(bgr_image)
+        faces = gpu_runner.run(face_app.get, bgr_image)
         print(f"Found {len(faces)} face(s)")
         current_path[0] = Path(image_path)
     else:
@@ -926,8 +969,7 @@ def _setup_main(root: tk.Tk, image_path: str | None, search_dir: Path, face_app,
             try:
                 new_pil = Image.open(file_path).convert("RGB")
                 new_bgr = _pil_to_bgr(new_pil)
-                with face_app_lock:
-                    new_faces = face_app.get(new_bgr)
+                new_faces = gpu_runner.run(face_app.get, new_bgr)
                 print(f"[Drop] Found {len(new_faces)} face(s)")
                 root.after(0, _apply_image, file_path, new_pil, new_faces)
                 root.after(0, status_var.set,
