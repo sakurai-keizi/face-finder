@@ -19,6 +19,7 @@ import time
 import hashlib
 import pickle
 import threading
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 import tkinter as tk
@@ -27,6 +28,7 @@ import numpy as np
 from PIL import Image, ImageTk, ImageDraw
 from insightface.app import FaceAnalysis
 import onnxruntime
+from scipy.ndimage import binary_fill_holes, binary_dilation
 from tkinterdnd2 import TkinterDnD, DND_FILES
 
 # tkinterdnd2 の既知バグ: DnD完了後にソースウィンドウへ XdndFinished を
@@ -48,6 +50,22 @@ THUMB_SIZE           = 220
 RESULT_COLS          = 4
 CACHE_FILENAME       = ".face_finder_cache.pkl"
 CACHE_VERSION        = 1
+
+
+def _normalize_emb(emb: np.ndarray) -> np.ndarray:
+    return emb / (np.linalg.norm(emb) + 1e-8)
+
+
+def _pil_to_bgr(img: Image.Image) -> np.ndarray:
+    return np.array(img)[:, :, ::-1].copy()
+
+
+@dataclass
+class SAM2Context:
+    predictor: object                  # hiera-small モデル
+    lock:      threading.Lock
+    extra:     dict                    # {"large": hiera-large | None}
+    yolo:      object | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +170,7 @@ class DirectoryFaceDB:
                 else:
                     # ---- 新規: InsightFace で検出 ----
                     img = Image.open(path).convert("RGB")
-                    bgr = np.array(img)[:, :, ::-1].copy()
+                    bgr = _pil_to_bgr(img)
                     with self.face_app_lock:
                         raw_faces = self.face_app.get(bgr)
 
@@ -196,7 +214,7 @@ class DirectoryFaceDB:
                exclude_path: Path | None = None) -> list[dict]:
         """画像ごとに最も類似度の高い顔を1件だけ返す（降順）。
         exclude_path が指定された場合、そのファイルは結果から除外する。"""
-        q = query_emb / (np.linalg.norm(query_emb) + 1e-8)
+        q = _normalize_emb(query_emb)
         exclude = exclude_path.resolve() if exclude_path else None
         best_per_image: dict[Path, dict] = {}
         with self._lock:
@@ -204,9 +222,7 @@ class DirectoryFaceDB:
         for rec in records:
             if exclude and rec["path"].resolve() == exclude:
                 continue
-            e   = rec["face"].embedding
-            e   = e / (np.linalg.norm(e) + 1e-8)
-            sim = float(np.dot(q, e))
+            sim = float(np.dot(q, _normalize_emb(rec["face"].embedding)))
             if sim < threshold:
                 continue
             key = rec["path"]
@@ -293,8 +309,7 @@ def make_face_thumb(pil_image: Image.Image, bbox, thumb_size=THUMB_SIZE) -> Imag
 def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                      face_db: "DirectoryFaceDB | None" = None,
                      query_emb: "np.ndarray | None" = None,
-                     sam2_predictor=None, sam2_lock: "threading.Lock | None" = None,
-                     yolo_model=None, sam2_extra: "dict | None" = None):
+                     sam2_ctx: "SAM2Context | None" = None):
     win = tk.Toplevel(root)
     win.title(str(path))
     win.configure(bg="#1e1e1e")
@@ -321,16 +336,20 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
     canvas = tk.Canvas(win, bg="#1e1e1e", highlightthickness=0)
     canvas.pack(fill=tk.BOTH, expand=True)
 
-    # SAM2 セグメンテーションマスク（バックグラウンドで取得）
+    norm_query_emb = _normalize_emb(query_emb) if query_emb is not None else None
+
     seg_mask: list[np.ndarray | None] = [None]
     current_mode = ["large"]  # "small" | "large"
 
     def _run_sam2():
-        import torch, traceback
+        import torch
+        if sam2_ctx is None:
+            return
+        lock = sam2_ctx.lock
+
         # モードに応じてモデルを選択（large は遅延ロード）
         if current_mode[0] == "large":
-            lock = sam2_lock if sam2_lock is not None else threading.Lock()
-            predictor = (sam2_extra or {}).get("large")
+            predictor = sam2_ctx.extra.get("large")
             if predictor is None:
                 try:
                     from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -339,44 +358,38 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                         predictor = SAM2ImagePredictor.from_pretrained(
                             "facebook/sam2.1-hiera-large", device="cpu"
                         )
-                    if sam2_extra is not None:
-                        sam2_extra["large"] = predictor
+                    sam2_ctx.extra["large"] = predictor
                     print("[SAM2] hiera-large loaded")
                 except Exception as e:
                     print(f"[SAM2] Large model load failed: {e}")
                     traceback.print_exc()
                     return
         else:
-            predictor = sam2_predictor
-        if predictor is None:
-            return
+            predictor = sam2_ctx.predictor
+
         x1, y1, x2, y2 = [int(c) for c in matched_bbox]
         cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
         img_arr = np.array(pil_image)
         try:
-            lock = sam2_lock if sam2_lock is not None else threading.Lock()
-
-            # --- YOLOv8 Pose でキーポイントと人物 BBOX を取得 ---
-            point_coords = [[cx, cy]]
-            point_labels = [1]
             fw, fh = x2 - x1, y2 - y1
             # YOLO 失敗時のフォールバック（全体画像・推定ボックス）
-            sam2_img  = img_arr
-            sam2_box  = [max(0, x1 - fw), max(0, y1 - int(fh * 0.5)),
-                         min(pil_image.width, x2 + fw),
-                         min(pil_image.height, y2 + int(fh * 6))]
+            sam2_img    = img_arr
+            sam2_box    = [max(0, x1 - fw), max(0, y1 - int(fh * 0.5)),
+                           min(pil_image.width, x2 + fw),
+                           min(pil_image.height, y2 + int(fh * 6))]
             crop_offset = (0, 0)
+            point_coords = [[cx, cy]]
+            point_labels = [1]
 
-            if yolo_model is not None:
+            if sam2_ctx.yolo is not None:
                 with lock:
-                    yolo_res = yolo_model(img_arr, verbose=False)
+                    yolo_res = sam2_ctx.yolo(img_arr, verbose=False)
                 if yolo_res and yolo_res[0].keypoints is not None:
                     boxes    = yolo_res[0].boxes.xyxy.cpu().numpy()
                     kps_xy   = yolo_res[0].keypoints.xy.cpu().numpy()
                     kps_conf = yolo_res[0].keypoints.conf
                     if kps_conf is not None:
                         kps_conf = kps_conf.cpu().numpy()
-                    # 顔 BBOX と最もオーバーラップする人物を選ぶ
                     best_idx, best_overlap = -1, 0.0
                     for i, (bx1_, by1_, bx2_, by2_) in enumerate(boxes):
                         ix = max(0, min(x2, bx2_) - max(x1, bx1_))
@@ -386,7 +399,6 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                             best_overlap, best_idx = overlap, i
                     if best_idx >= 0 and best_overlap > 0.3:
                         bx1_, by1_, bx2_, by2_ = boxes[best_idx]
-                        # キーポイントを前景点に
                         kps  = kps_xy[best_idx]
                         conf = kps_conf[best_idx] if kps_conf is not None \
                                else np.ones(len(kps))
@@ -397,22 +409,18 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                             point_coords = valid
                             point_labels = [1] * len(valid)
                         # 人物 BBOX を 1.2倍拡張して crop
-                        mx = (bx2_ - bx1_) * 0.1
-                        my = (by2_ - by1_) * 0.1
-                        ox = max(0, int(bx1_ - mx))
-                        oy = max(0, int(by1_ - my))
+                        mx  = (bx2_ - bx1_) * 0.1
+                        my  = (by2_ - by1_) * 0.1
+                        ox  = max(0, int(bx1_ - mx))
+                        oy  = max(0, int(by1_ - my))
                         ox2 = min(pil_image.width,  int(bx2_ + mx))
                         oy2 = min(pil_image.height, int(by2_ + my))
                         sam2_img     = img_arr[oy:oy2, ox:ox2]
                         crop_offset  = (ox, oy)
-                        # 座標を crop 基準に変換
-                        point_coords = [(kpx - ox, kpy - oy)
-                                        for kpx, kpy in point_coords]
-                        sam2_box     = [bx1_ - ox, by1_ - oy,
-                                        bx2_ - ox, by2_ - oy]
+                        point_coords = [(kpx - ox, kpy - oy) for kpx, kpy in point_coords]
+                        sam2_box     = [bx1_ - ox, by1_ - oy, bx2_ - ox, by2_ - oy]
                         print(f"[YOLO] {len(valid)} kps, crop={sam2_img.shape[:2]}")
 
-            # --- SAM2 推論 ---
             with lock:
                 with torch.inference_mode():
                     predictor.set_image(sam2_img)
@@ -422,10 +430,8 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
                         box=np.array(sam2_box),
                         multimask_output=True,
                     )
-            from scipy.ndimage import binary_fill_holes
             crop_mask = binary_fill_holes(masks[scores.argmax()])
 
-            # crop マスクを元画像サイズに展開
             if crop_offset == (0, 0) and crop_mask.shape == (pil_image.height, pil_image.width):
                 seg_mask[0] = crop_mask
             else:
@@ -460,12 +466,9 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
         draw = ImageDraw.Draw(img)
 
         # 点線BBOX: 有り得そうな他の顔
-        if face_db is not None and query_emb is not None:
-            q = query_emb / (np.linalg.norm(query_emb) + 1e-8)
+        if face_db is not None and norm_query_emb is not None:
             for rec in face_db.faces_in_image(path):
-                e   = rec["face"].embedding
-                e   = e / (np.linalg.norm(e) + 1e-8)
-                sim = float(np.dot(q, e))
+                sim = float(np.dot(norm_query_emb, _normalize_emb(rec["face"].embedding)))
                 rx1, ry1 = rec["face"].bbox[0], rec["face"].bbox[1]
                 mx1, my1 = matched_bbox[0], matched_bbox[1]
                 if not (abs(rx1 - mx1) < 5 and abs(ry1 - my1) < 5) and sim >= PLAUSIBLE_THRESHOLD:
@@ -546,7 +549,6 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
             i += 1
 
         # セマセグ結果: 輪郭を5%膨張してからRGBAで切り出す
-        from scipy.ndimage import binary_dilation
         rows = np.where(mask.any(axis=1))[0]
         cols = np.where(mask.any(axis=0))[0]
         radius = max(1, int(min(rows[-1] - rows[0], cols[-1] - cols[0]) * 0.05))
@@ -587,8 +589,7 @@ def _open_full_image(root, pil_image: Image.Image, matched_bbox, path,
 
 def open_results_window(root, results: list[dict], query_face_idx: int,
                         face_db=None, query_emb=None,
-                        sam2_predictor=None, sam2_lock=None, yolo_model=None,
-                        sam2_extra=None):
+                        sam2_ctx: "SAM2Context | None" = None):
     win = tk.Toplevel(root)
     win.title(f"Search results for Face #{query_face_idx + 1}  ({len(results)} match(es))")
     win.configure(bg="#1e1e1e")
@@ -650,8 +651,7 @@ def open_results_window(root, results: list[dict], query_face_idx: int,
         def open_full(event, r=rec):
             _open_full_image(root, r["pil_image"], r["face"].bbox, r["path"],
                              face_db=face_db, query_emb=query_emb,
-                             sam2_predictor=sam2_predictor, sam2_lock=sam2_lock,
-                             yolo_model=yolo_model, sam2_extra=sam2_extra)
+                             sam2_ctx=sam2_ctx)
 
         img_label.bind("<Button-1>", open_full)
 
@@ -805,18 +805,21 @@ def main():
             root.destroy()
             return
 
+        sam2_ctx = SAM2Context(
+            predictor=init_result["sam2_predictor"],
+            lock=threading.Lock(),
+            extra={"large": None},
+            yolo=init_result.get("yolo_model"),
+        )
         _setup_main(root, image_path, search_dir, init_result["face_app"],
-                    sam2_predictor=init_result["sam2_predictor"],
-                    yolo_model=init_result.get("yolo_model"))
+                    sam2_ctx=sam2_ctx)
 
     root.mainloop()
 
 
 def _setup_main(root: tk.Tk, image_path: str | None, search_dir: Path, face_app,
-                sam2_predictor=None, yolo_model=None):
+                sam2_ctx: "SAM2Context | None" = None):
     face_app_lock = threading.Lock()
-    sam2_lock     = threading.Lock() if sam2_predictor is not None else None
-    sam2_extra    = {"large": None}  # 高精度モデルの遅延ロード用
     INFO_PANEL_W  = 320
     PLACEHOLDER_W, PLACEHOLDER_H = 640, 480
 
@@ -831,7 +834,7 @@ def _setup_main(root: tk.Tk, image_path: str | None, search_dir: Path, face_app,
     if image_path:
         print("Detecting faces in main image...")
         pil_image = Image.open(image_path).convert("RGB")
-        bgr_image = np.array(pil_image)[:, :, ::-1].copy()
+        bgr_image = _pil_to_bgr(pil_image)
         with face_app_lock:
             faces = face_app.get(bgr_image)
         print(f"Found {len(faces)} face(s)")
@@ -979,7 +982,7 @@ def _setup_main(root: tk.Tk, image_path: str | None, search_dir: Path, face_app,
         def _detect():
             try:
                 new_pil = Image.open(file_path).convert("RGB")
-                new_bgr = np.array(new_pil)[:, :, ::-1].copy()
+                new_bgr = _pil_to_bgr(new_pil)
                 with face_app_lock:
                     new_faces = face_app.get(new_bgr)
                 print(f"[Drop] Found {len(new_faces)} face(s)")
@@ -1059,8 +1062,7 @@ def _setup_main(root: tk.Tk, image_path: str | None, search_dir: Path, face_app,
     def _show_results(results, face_idx, query_emb):
         status_var.set(f"{len(results)} match(es) found")
         open_results_window(root, results, face_idx, face_db=face_db, query_emb=query_emb,
-                            sam2_predictor=sam2_predictor, sam2_lock=sam2_lock,
-                            yolo_model=yolo_model, sam2_extra=sam2_extra)
+                            sam2_ctx=sam2_ctx)
 
     canvas.bind("<Button-1>", on_click)
 
